@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Attendance Records - Face Recognition System</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1><i class="fas fa-user-check"></i> Attendance Records</h1>
+            <a href="{{ url_for('index') }}" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Dashboard</a>
+        </header>
+        
+        <div class="attendance-container">
+            {% if records is mapping and records.get('error') %}
+                <div class="error-message">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <p>{{ records.error }}</p>
+                </div>
+            {% else %}
+                <div class="filters">
+                    <div class="search-box">
+                        <input type="text" id="search-input" placeholder="Search by name...">
+                        <i class="fas fa-search"></i>
+                    </div>
+                    <div class="filter-options">
+                        <select id="status-filter">
+                            <option value="all">All Status</option>
+                            <option value="VALID">Valid</option>
+                            <option value="INVALID">Invalid</option>
+                        </select>
+                        <select id="date-filter">
+                            <option value="all">All Dates</option>
+                            {% for date in records.keys() %}
+                                <option value="{{ date }}">{{ date }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+
+                <div class="records-container">
+                    <div class="records-header">
+                        <button id="export-btn" class="btn info small-btn">
+                            <i class="fas fa-file-export"></i> Export to CSV
+                        </button>
+                    </div>
+                    
+                    {% for date, date_records in records.items() %}
+                    <div class="date-group" data-date="{{ date }}">
+                        <div class="date-header">
+                            <h2>{{ date }}</h2>
+                            <span class="record-count">{{ date_records|length }} records</span>
+                        </div>
+                        <table class="records-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Time</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for record in date_records %}
+                                <tr class="record-row {% if 'INVALID' in record.status %}invalid{% endif %}" data-name="{{ record.name }}" data-status="{{ record.status }}">
+                                    <td>{{ record.name }}</td>
+                                    <td>{{ record.time }}</td>
+                                    <td class="status-cell {% if 'INVALID' in record.status %}invalid{% endif %}">
+                                        {% if 'INVALID' in record.status %}
+                                            <i class="fas fa-times-circle"></i>
+                                        {% else %}
+                                            <i class="fas fa-check-circle"></i>
+                                        {% endif %}
+                                        {{ record.status }}
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        </div>
+        
+        <footer>
+            <p>&copy; 2023 Face Recognition Attendance System</p>
+        </footer>
+    </div>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Search functionality
+            const searchInput = document.getElementById('search-input');
+            const statusFilter = document.getElementById('status-filter');
+            const dateFilter = document.getElementById('date-filter');
+            const exportBtn = document.getElementById('export-btn');
+            
+            function applyFilters() {
+                const searchTerm = searchInput.value.toLowerCase();
+                const statusValue = statusFilter.value;
+                const dateValue = dateFilter.value;
+                
+                // Get all date groups and record rows
+                const dateGroups = document.querySelectorAll('.date-group');
+                
+                // Filter by date first
+                dateGroups.forEach(group => {
+                    const groupDate = group.getAttribute('data-date');
+                    if (dateValue === 'all' || groupDate === dateValue) {
+                        group.style.display = 'block';
+                    } else {
+                        group.style.display = 'none';
+                    }
+                });
+                
+                // Then filter rows by name and status
+                const rows = document.querySelectorAll('.record-row');
+                let visibleCount = 0;
+                
+                rows.forEach(row => {
+                    const name = row.getAttribute('data-name').toLowerCase();
+                    const status = row.getAttribute('data-status');
+                    const dateGroup = row.closest('.date-group');
+                    
+                    if (dateGroup.style.display === 'none') {
+                        row.style.display = 'none';
+                        return;
+                    }
+                    
+                    const nameMatch = name.includes(searchTerm);
+                    const statusMatch = statusValue === 'all' || status.includes(statusValue);
+                    
+                    if (nameMatch && statusMatch) {
+                        row.style.display = 'table-row';
+                        visibleCount++;
+                    } else {
+                        row.style.display = 'none';
+                    }
+                });
+                
+                // Update record counts for each visible date group
+                dateGroups.forEach(group => {
+                    if (group.style.display !== 'none') {
+                        const visibleRows = group.querySelectorAll('.record-row[style="display: table-row"]').length;
+                        const countElement = group.querySelector('.record-count');
+                        countElement.textContent = `${visibleRows} records`;
+                        
+                        // Hide date groups with no visible records
+                        if (visibleRows === 0) {
+                            group.style.display = 'none';
+                        }
+                    }
+                });
+            }
+            
+            // Add event listeners for filters
+            searchInput.addEventListener('input', applyFilters);
+            statusFilter.addEventListener('change', applyFilters);
+            dateFilter.addEventListener('change', applyFilters);
+            
+            // Export to CSV functionality
+            exportBtn.addEventListener('click', function() {
+                // Get currently visible rows
+                const visibleDateGroups = document.querySelectorAll('.date-group[style="display: block"]');
+                const rows = [];
+                
+                // Add header row
+                rows.push(['Name', 'Time', 'Date', 'Status']);
+                
+                // Add data rows
+                visibleDateGroups.forEach(group => {
+                    const date = group.getAttribute('data-date');
+                    const visibleRows = group.querySelectorAll('.record-row[style="display: table-row"]');
+                    
+                    visibleRows.forEach(row => {
+                        const name = row.getAttribute('data-name');
+                        const status = row.getAttribute('data-status');
+                        const time = row.querySelector('td:nth-child(2)').textContent.trim();
+                        
+                        rows.push([name, time, date, status]);
+                    });
+                });
+                
+                // Convert to CSV string
+                let csvContent = "data:text/csv;charset=utf-8,";
+                rows.forEach(rowArray => {
+                    const row = rowArray.join(",");
+                    csvContent += row + "\r\n";
+                });
+                
+                // Download the CSV file
+                const encodedUri = encodeURI(csvContent);
+                const link = document.createElement("a");
+                link.setAttribute("href", encodedUri);
+                link.setAttribute("download", `attendance_${new Date().toISOString().slice(0,10)}.csv`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            });
+        });
+    </script>
+</body>
+</html> 
