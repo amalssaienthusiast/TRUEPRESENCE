@@ -1,69 +1,61 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+# run_attendance_system.sh
+# Launcher for the Face Recognition Attendance System
+# =============================================================================
 
-# Face Recognition Attendance System Runner
-echo "Starting Face Recognition Attendance System..."
+set -euo pipefail
 
-# Navigate to the flask_app directory
-cd "$(dirname "$0")/flask_app"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
-# Check if pip/pip3 is available
-if command -v pip3 &> /dev/null; then
-    PIP_CMD="pip3"
-elif command -v pip &> /dev/null; then
-    PIP_CMD="pip"
-else
-    echo "Error: pip not found. Please install Python and pip first."
-    exit 1
-fi
+# --- colours -----------------------------------------------------------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-# Check if dependencies are installed
-echo "Checking dependencies..."
-FLASK_INSTALLED=$($PIP_CMD list | grep -i flask || echo "")
-if [ -z "$FLASK_INSTALLED" ]; then
-    echo "Installing Flask..."
-    $PIP_CMD install flask
-fi
+# --- Python ------------------------------------------------------------------
+PYTHON=$(command -v python3 || command -v python || true)
+[ -z "$PYTHON" ] && error "Python 3 not found. Install Python 3.10+."
+info "Python: $($PYTHON --version)"
 
-# Check if the Python scripts exist in the parent directory
-PARENT_DIR="$(dirname "$0")"
-REQUIRED_SCRIPTS=("attendance_taker.py" "get_faces_from_camera_tkinter.py" "features_extraction_to_csv.py")
-MISSING_SCRIPTS=()
-
-for script in "${REQUIRED_SCRIPTS[@]}"; do
-    if [ ! -f "$PARENT_DIR/$script" ]; then
-        MISSING_SCRIPTS+=("$script")
-    fi
-done
-
-if [ ${#MISSING_SCRIPTS[@]} -gt 0 ]; then
-    echo "WARNING: The following required scripts were not found:"
-    for script in "${MISSING_SCRIPTS[@]}"; do
-        echo "  - $script"
+# --- PostgreSQL via Docker Compose -------------------------------------------
+if command -v docker &>/dev/null; then
+    info "Starting PostgreSQL container..."
+    docker compose up -d 2>&1 | grep -v "^$" || true
+    info "Waiting for PostgreSQL to be healthy..."
+    for i in $(seq 1 20); do
+        status=$(docker inspect attendance_postgres --format='{{.State.Health.Status}}' 2>/dev/null || echo "not_found")
+        if [ "$status" = "healthy" ]; then
+            info "PostgreSQL is healthy ✓"
+            break
+        fi
+        [ "$i" -eq 20 ] && warn "Postgres may not be ready yet — continuing anyway"
+        sleep 2
     done
-    echo "Please ensure these files are in the parent directory: $PARENT_DIR"
-    read -p "Do you want to continue anyway? (y/n): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
-fi
-
-# Determine the Python command to use
-if command -v python3 &> /dev/null; then
-    PYTHON_CMD="python3"
-elif command -v python &> /dev/null; then
-    PYTHON_CMD="python"
 else
-    echo "Error: Python not found. Please install Python first."
-    exit 1
+    warn "Docker not found. Ensure PostgreSQL is running manually (see .env for connection details)."
 fi
 
-# Launch the Flask app
-echo "Launching Face Recognition Attendance System..."
-$PYTHON_CMD app.py
+# --- Python dependencies -----------------------------------------------------
+info "Installing/verifying Python dependencies..."
+$PYTHON -m pip install -r requirements.txt --quiet
 
-# Keep terminal open if error occurs
-if [ $? -ne 0 ]; then
-    echo "Error occurred while running the application."
-    read -p "Press Enter to exit..." -n 1 -r
-fi 
+# --- Check dlib models -------------------------------------------------------
+MODELS_DIR="data/data_dlib"
+LANDMARKS="$MODELS_DIR/shape_predictor_68_face_landmarks.dat"
+FACE_REC="$MODELS_DIR/dlib_face_recognition_resnet_model_v1.dat"
+if [ ! -f "$LANDMARKS" ] || [ ! -f "$FACE_REC" ]; then
+    warn "dlib model files not found in $MODELS_DIR/"
+    warn "Download them from: http://dlib.net/files/"
+    warn "  - shape_predictor_68_face_landmarks.dat.bz2"
+    warn "  - dlib_face_recognition_resnet_model_v1.dat.bz2"
+    warn "Decompress and place both .dat files in $MODELS_DIR/"
+    read -rp "Press Enter to continue anyway, or Ctrl-C to abort..."
+fi
+
+# --- Launch Flask dashboard --------------------------------------------------
+info "Launching Flask dashboard → http://localhost:5000"
+cd flask_app
+exec $PYTHON app.py

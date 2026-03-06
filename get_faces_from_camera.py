@@ -1,3 +1,19 @@
+"""
+get_faces_from_camera.py — Face Registration System (PyQt6)
+
+Captures face images from a live camera feed for later feature extraction
+and recognition.  Uses PyQt6 — fully replaces the original tkinter implementation with a
+fully equivalent PyQt6 GUI.
+
+Workflow
+--------
+1. Enter a numeric ID and a full name, then click "Create Person Folder".
+2. Align face inside the green guide box and press **Space** (or the button)
+   to capture a snapshot.
+3. Repeat step 2 until enough samples are collected (≥10 recommended).
+4. Run features_extraction_to_csv.py to build the recognition model.
+"""
+
 import dlib
 import numpy as np
 import cv2
@@ -5,532 +21,470 @@ import os
 import shutil
 import time
 import logging
-import tkinter as tk
-from tkinter import ttk
-from tkinter import font as tkFont
-from tkinter import messagebox
-from PIL import Image, ImageTk
+import sys
 
-# Initialize dlib's face detector
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QLineEdit, QTextEdit, QGroupBox, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QMessageBox, QSizePolicy, QScrollBar,
+)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QImage, QPixmap, QFont, QColor
+
+# macOS: prevent OpenCV from requesting camera auth via background run loop.
+# Camera is opened from the main thread in FaceRegisterApp.__init__().
+import os as _os
+_os.environ.setdefault("OPENCV_AVFOUNDATION_SKIP_AUTH", "1")
+
+# ---------------------------------------------------------------------------
+# dlib setup
+# ---------------------------------------------------------------------------
 detector = dlib.get_frontal_face_detector()
 
-class FaceRegisterApp:
-    def __init__(self):
-        # Initialize counters
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Main application window
+# ---------------------------------------------------------------------------
+
+class FaceRegisterApp(QMainWindow):
+    """PyQt6 face-registration application."""
+
+    # Path where per-person image folders are stored
+    PATH_PHOTOS = "data/data_faces_from_camera/"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Face Registration System")
+        self.setMinimumSize(1200, 700)
+
+        # ── state ────────────────────────────────────────────────────────────
+        self.existing_faces_cnt      = 0
+        self.ss_cnt                  = 0          # images saved for current person
         self.current_frame_faces_cnt = 0
-        self.existing_faces_cnt = 0
-        self.ss_cnt = 0
-        
-        # Setup main window with light theme
-        self.win = tk.Tk()
-        self.win.title("Face Registration System")
-        self.win.geometry("1200x700")
-        self.win.configure(bg='white')
-        
-        # Set theme and styles
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
-        self.configure_styles()
-        
-        # Setup window close behavior
-        self.win.protocol("WM_DELETE_WINDOW", self.close_app)
-        
-        # Camera and processing variables
-        self.current_frame = np.ndarray
-        self.face_ROI_image = np.ndarray
-        self.out_of_range_flag = False
+
         self.face_folder_created_flag = False
-        
-        # FPS tracking
-        self.frame_time = 0
-        self.frame_start_time = 0
-        self.fps = 0.0
-        self.start_time = time.time()
-        
-        # Path configuration
-        self.path_photos_from_camera = "data/data_faces_from_camera/"
-        self.current_face_dir = None
-        
-        # Initialize GUI components
-        self.setup_gui()
-        
-        # Initialize camera
-        self.cap = self.initialize_camera()
-        
-        # Create necessary directories
-        self.pre_work_mkdir()
-        self.check_existing_faces_cnt()
+        self.out_of_range_flag        = False
 
-    def configure_styles(self):
-        """Configure ttk styles for light theme"""
-        self.style.configure('.', background='white', foreground='black')
-        self.style.configure('TFrame', background='white')
-        self.style.configure('TLabel', background='white', foreground='black')
-        self.style.configure('TButton', background='#f0f0f0', foreground='black', 
-                           borderwidth=1, focusthickness=3, focuscolor='none')
-        self.style.configure('TEntry', fieldbackground='white')
-        self.style.configure('TLabelframe', background='white', foreground='#333333')
-        self.style.configure('TLabelframe.Label', background='white', foreground='#333333')
-        self.style.map('TButton',
-                     background=[('active', '#e0e0e0'), ('pressed', '#d0d0d0')],
-                     foreground=[('active', 'black'), ('pressed', 'black')])
+        # last detected face bounding box (for saving the ROI)
+        self._face_left   = 0
+        self._face_top    = 0
+        self._face_width  = 0
+        self._face_height = 0
 
-    def setup_gui(self):
-        """Setup all GUI components"""
-        # Main frames
-        self.main_frame = ttk.Frame(self.win)
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Camera frame (left)
-        self.camera_frame = ttk.LabelFrame(self.main_frame, text="Camera Feed")
-        self.camera_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.camera_label = ttk.Label(self.camera_frame)
-        self.camera_label.pack(padx=10, pady=10)
-        
-        # Control frame (right)
-        self.control_frame = ttk.Frame(self.main_frame)
-        self.control_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
-        
-        # Information panel
-        self.info_panel = ttk.LabelFrame(self.control_frame, text="System Information")
-        self.info_panel.pack(fill=tk.X, pady=5)
-        
-        self.setup_info_panel()
-        
-        # Registration panel
-        self.reg_panel = ttk.LabelFrame(self.control_frame, text="Registration Steps")
-        self.reg_panel.pack(fill=tk.X, pady=5)
-        
-        self.setup_registration_panel()
-        
-        # Actions panel
-        self.actions_panel = ttk.LabelFrame(self.control_frame, text="Actions")
-        self.actions_panel.pack(fill=tk.X, pady=5)
-        
-        self.setup_actions_panel()
-        
-        # Log panel
-        self.log_panel = ttk.LabelFrame(self.control_frame, text="Activity Log")
-        self.log_panel.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        self.setup_log_panel()
+        self.current_frame: np.ndarray | None = None  # latest RGB frame
 
-    def setup_info_panel(self):
-        """Setup the information display panel"""
-        # FPS display
-        ttk.Label(self.info_panel, text="FPS:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
-        self.fps_label = ttk.Label(self.info_panel, text="0.00")
-        self.fps_label.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        # Database count
-        ttk.Label(self.info_panel, text="Registered Persons:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
-        self.db_count_label = ttk.Label(self.info_panel, text="0")
-        self.db_count_label.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        # Faces in frame
-        ttk.Label(self.info_panel, text="Faces Detected:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
-        self.face_count_label = ttk.Label(self.info_panel, text="0")
-        self.face_count_label.grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        # Warning label
-        self.warning_label = ttk.Label(self.info_panel, text="", foreground="red")
-        self.warning_label.grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2)
+        # FPS smoothing
+        self._frame_start_time = time.time()
+        self._fps              = 0.0
 
-    def setup_registration_panel(self):
-        """Setup the registration controls"""
-        # Step 1: Input details
-        ttk.Label(self.reg_panel, text="Step 1: Enter Person Details").grid(
-            row=0, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(5, 2))
-        
-        ttk.Label(self.reg_panel, text="ID (numbers only):").grid(
-            row=1, column=0, sticky=tk.W, padx=5, pady=2)
-        self.id_entry = ttk.Entry(self.reg_panel, validate="key")
-        self.id_entry['validatecommand'] = (self.id_entry.register(self.validate_id), '%P')
-        self.id_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=2)
-        
-        ttk.Label(self.reg_panel, text="Full Name:").grid(
-            row=2, column=0, sticky=tk.W, padx=5, pady=2)
-        self.name_entry = ttk.Entry(self.reg_panel)
-        self.name_entry.grid(row=2, column=1, sticky=tk.EW, padx=5, pady=2)
-        
-        self.create_folder_btn = ttk.Button(
-            self.reg_panel, text="Create Person Folder", 
-            command=self.create_face_folder, style='Accent.TButton')
-        self.create_folder_btn.grid(row=3, column=0, columnspan=2, sticky=tk.EW, padx=5, pady=5)
-        
-        # Step 2: Capture faces
-        ttk.Label(self.reg_panel, text="Step 2: Capture Face Images").grid(
-            row=4, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(10, 2))
-        
-        self.capture_btn = ttk.Button(
-            self.reg_panel, text="Capture Face (Space)", 
-            command=self.save_current_face, state='disabled')
-        self.capture_btn.grid(row=5, column=0, columnspan=2, sticky=tk.EW, padx=5, pady=5)
-        
-        # Bind space key to capture
-        self.win.bind('<space>', lambda event: self.save_current_face())
+        self.current_face_dir: str | None = None
 
-    def setup_actions_panel(self):
-        """Setup action buttons"""
-        self.clear_data_btn = ttk.Button(
-            self.actions_panel, text="Clear All Data", 
-            command=self.clear_data)
-        self.clear_data_btn.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.exit_btn = ttk.Button(
-            self.actions_panel, text="Exit", 
-            command=self.close_app)
-        self.exit_btn.pack(fill=tk.X, padx=5, pady=5)
+        # ── build UI ─────────────────────────────────────────────────────────
+        self._build_ui()
 
-    def setup_log_panel(self):
-        """Setup the logging text area"""
-        self.log_text = tk.Text(
-            self.log_panel, height=10, state='disabled', 
-            bg='white', fg='black', wrap=tk.WORD)
-        
-        scrollbar = ttk.Scrollbar(
-            self.log_panel, command=self.log_text.yview)
-        self.log_text['yscrollcommand'] = scrollbar.set
-        
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # ── camera ───────────────────────────────────────────────────────────
+        self.cap = self._init_camera()
 
-    def validate_id(self, text):
-        """Validate that ID contains only numbers"""
-        if text == "":
-            return True
-        try:
-            int(text)
-            return True
-        except ValueError:
-            return False
+        # ── data directory ───────────────────────────────────────────────────
+        os.makedirs(self.PATH_PHOTOS, exist_ok=True)
+        self._refresh_face_count()
 
-    def initialize_camera(self):
-        """Initialize the camera with error handling"""
+        # ── camera timer (≈30 fps) ───────────────────────────────────────────
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._process_frame)
+        self._timer.start(33)
+
+    # =========================================================================
+    # UI construction
+    # =========================================================================
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        # ── left: camera feed ────────────────────────────────────────────────
+        cam_group = QGroupBox("Camera Feed")
+        cam_layout = QVBoxLayout(cam_group)
+        self.camera_label = QLabel("Camera initialising…")
+        self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.camera_label.setMinimumSize(640, 480)
+        self.camera_label.setStyleSheet("background:#111; color:#888;")
+        cam_layout.addWidget(self.camera_label)
+        root.addWidget(cam_group, stretch=3)
+
+        # ── right: controls ──────────────────────────────────────────────────
+        right_widget = QWidget()
+        right_widget.setMaximumWidth(400)
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setSpacing(8)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        right_layout.addWidget(self._build_info_panel())
+        right_layout.addWidget(self._build_registration_panel())
+        right_layout.addWidget(self._build_actions_panel())
+        right_layout.addWidget(self._build_log_panel(), stretch=1)
+
+        root.addWidget(right_widget, stretch=1)
+
+    def _build_info_panel(self) -> QGroupBox:
+        group = QGroupBox("System Information")
+        grid  = QGridLayout(group)
+        grid.setColumnStretch(1, 1)
+
+        grid.addWidget(QLabel("FPS:"),               0, 0)
+        self.fps_label   = QLabel("0.00")
+        grid.addWidget(self.fps_label,               0, 1)
+
+        grid.addWidget(QLabel("Registered Persons:"), 1, 0)
+        self.db_count_label = QLabel("0")
+        grid.addWidget(self.db_count_label,          1, 1)
+
+        grid.addWidget(QLabel("Faces Detected:"),    2, 0)
+        self.face_count_label = QLabel("0")
+        grid.addWidget(self.face_count_label,        2, 1)
+
+        self.warning_label = QLabel("")
+        self.warning_label.setStyleSheet("color:red; font-weight:bold;")
+        grid.addWidget(self.warning_label,           3, 0, 1, 2)
+        return group
+
+    def _build_registration_panel(self) -> QGroupBox:
+        group  = QGroupBox("Registration Steps")
+        layout = QGridLayout(group)
+        layout.setColumnStretch(1, 1)
+
+        layout.addWidget(QLabel("<b>Step 1 — Enter Person Details</b>"), 0, 0, 1, 2)
+
+        layout.addWidget(QLabel("ID (numbers only):"), 1, 0)
+        self.id_entry = QLineEdit()
+        self.id_entry.setPlaceholderText("e.g. 1")
+        self.id_entry.textChanged.connect(self._enforce_numeric_id)
+        layout.addWidget(self.id_entry, 1, 1)
+
+        layout.addWidget(QLabel("Full Name:"), 2, 0)
+        self.name_entry = QLineEdit()
+        self.name_entry.setPlaceholderText("e.g. Alice Smith")
+        layout.addWidget(self.name_entry, 2, 1)
+
+        self.create_folder_btn = QPushButton("📁  Create Person Folder")
+        self.create_folder_btn.clicked.connect(self._create_face_folder)
+        self.create_folder_btn.setStyleSheet(
+            "background:#4CAF50; color:white; padding:8px; font-weight:bold; border-radius:4px;")
+        layout.addWidget(self.create_folder_btn, 3, 0, 1, 2)
+
+        layout.addWidget(QLabel("<b>Step 2 — Capture Face Images</b>"), 4, 0, 1, 2)
+
+        self.capture_btn = QPushButton("📷  Capture Face  [Space]")
+        self.capture_btn.clicked.connect(self._save_current_face)
+        self.capture_btn.setEnabled(False)
+        self.capture_btn.setStyleSheet(
+            "background:#2196F3; color:white; padding:8px; font-weight:bold; border-radius:4px;")
+        layout.addWidget(self.capture_btn, 5, 0, 1, 2)
+
+        self.capture_count_label = QLabel("Captured: 0 images")
+        layout.addWidget(self.capture_count_label, 6, 0, 1, 2)
+        return group
+
+    def _build_actions_panel(self) -> QGroupBox:
+        group  = QGroupBox("Actions")
+        layout = QVBoxLayout(group)
+
+        clear_btn = QPushButton("🗑  Clear All Registered Data")
+        clear_btn.clicked.connect(self._clear_data)
+        clear_btn.setStyleSheet(
+            "background:#f44336; color:white; padding:7px; border-radius:4px;")
+        layout.addWidget(clear_btn)
+
+        exit_btn = QPushButton("✖  Exit")
+        exit_btn.clicked.connect(self.close)
+        exit_btn.setStyleSheet("padding:7px; border-radius:4px;")
+        layout.addWidget(exit_btn)
+        return group
+
+    def _build_log_panel(self) -> QGroupBox:
+        group  = QGroupBox("Activity Log")
+        layout = QVBoxLayout(group)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Courier", 9))
+        self.log_text.setStyleSheet("background:#f9f9f9;")
+        layout.addWidget(self.log_text)
+        return group
+
+    # =========================================================================
+    # Camera helpers
+    # =========================================================================
+
+    def _init_camera(self) -> cv2.VideoCapture | None:
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            self.log_message("ERROR: Could not open camera.", error=True)
-            messagebox.showerror(
-                "Camera Error", 
-                "Could not open camera. Please check:\n"
-                "1. Camera is connected\n"
-                "2. No other application is using the camera\n"
-                "3. Permissions are granted")
-            self.win.after(100, self.win.destroy)
+            QMessageBox.critical(
+                self, "Camera Error",
+                "Could not open camera.\n"
+                "• Check the camera is connected.\n"
+                "• No other app is using it.\n"
+                "• macOS/Windows privacy permissions are granted.",
+            )
             return None
-        
-        # Set camera resolution to 640x480 for consistency
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self._log("Camera opened (640×480)")
         return cap
 
-    def log_message(self, message, error=False):
-        """Add a message to the log with timestamp"""
-        timestamp = time.strftime("%H:%M:%S", time.localtime())
-        log_entry = f"[{timestamp}] {message}\n"
-        
-        self.log_text.config(state='normal')
-        if error:
-            self.log_text.tag_config('error', foreground='red')
-            self.log_text.insert(tk.END, log_entry, 'error')
-        else:
-            self.log_text.insert(tk.END, log_entry)
-            
-        self.log_text.config(state='disabled')
-        self.log_text.see(tk.END)
-        logging.info(message)
+    def _process_frame(self) -> None:
+        """Read one frame, detect faces, annotate and display."""
+        if not self.cap:
+            return
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            return
 
-    def pre_work_mkdir(self):
-        """Create necessary directories if they don't exist"""
-        os.makedirs(self.path_photos_from_camera, exist_ok=True)
-        self.log_message("Initialized data directory")
+        frame = cv2.resize(frame, (640, 480))
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self.current_frame = frame_rgb.copy()
 
-    def check_existing_faces_cnt(self):
-        """Count existing registered persons"""
-        try:
-            if os.path.isdir(self.path_photos_from_camera):
-                person_folders = [d for d in os.listdir(self.path_photos_from_camera)
-                                 if os.path.isdir(os.path.join(self.path_photos_from_camera, d)) 
-                                 and d.startswith("person_")]
-                self.existing_faces_cnt = len(person_folders)
-            else:
-                self.existing_faces_cnt = 0
-                
-            self.db_count_label['text'] = str(self.existing_faces_cnt)
-        except Exception as e:
-            self.log_message(f"Error counting existing faces: {str(e)}", error=True)
-            self.existing_faces_cnt = 0
-
-    def update_fps(self):
-        """Calculate and update FPS display"""
+        # FPS smoothing
         now = time.time()
-        if now > self.start_time:
-            self.frame_time = now - self.frame_start_time
-            if self.frame_time > 0:
-                self.fps = 0.9 * self.fps + 0.1 * (1.0 / self.frame_time)  # Smoothing
-        
-        self.frame_start_time = now
-        
-        # Update display every second
-        if int(self.start_time) != int(now):
-            self.fps_label["text"] = f"{self.fps:.2f}"
-        self.start_time = now
+        dt  = now - self._frame_start_time
+        self._fps = 0.9 * self._fps + 0.1 * (1.0 / dt if dt > 0 else 0)
+        self._frame_start_time = now
+        self.fps_label.setText(f"{self._fps:.2f}")
 
-    def create_face_folder(self):
-        """Create a folder for a new person"""
-        person_id = self.id_entry.get().strip()
-        person_name = self.name_entry.get().strip()
-        
-        # Validation
-        if not person_id:
-            messagebox.showwarning("Input Required", "Please enter a numeric ID.")
-            return
-        if not person_name:
-            messagebox.showwarning("Input Required", "Please enter a name.")
-            return
-        
-        # Create folder name
-        clean_name = "".join(c if c.isalnum() else "_" for c in person_name)
-        self.current_face_dir = os.path.join(
-            self.path_photos_from_camera, 
-            f"person_{person_id}_{clean_name}")
-        
+        # Face detection
+        faces = detector(frame_rgb, 0)
+        self.current_frame_faces_cnt = len(faces)
+        self.face_count_label.setText(str(len(faces)))
+        self.out_of_range_flag = False
+
+        for face in faces:
+            margin = 20
+            too_close = (
+                face.left()   < margin or
+                face.right()  > 640 - margin or
+                face.top()    < margin or
+                face.bottom() > 480 - margin
+            )
+            if too_close:
+                self.out_of_range_flag = True
+                color = (220, 50, 50)
+            else:
+                color = (50, 220, 50)
+                self._face_left   = face.left()
+                self._face_top    = face.top()
+                self._face_width  = face.width()
+                self._face_height = face.height()
+
+            size = max(face.width(), face.height())
+            cx   = face.left() + face.width()  // 2
+            cy   = face.top()  + face.height() // 2
+
+            # Outer white guide square
+            cv2.rectangle(frame_rgb,
+                          (cx - size // 2 - 6, cy - size // 2 - 6),
+                          (cx + size // 2 + 6, cy + size // 2 + 6),
+                          (255, 255, 255), 1)
+            # Inner coloured square
+            cv2.rectangle(frame_rgb,
+                          (cx - size // 2, cy - size // 2),
+                          (cx + size // 2, cy + size // 2),
+                          color, 2)
+            # Crosshair
+            cv2.line(frame_rgb, (cx - 18, cy), (cx + 18, cy), color, 1)
+            cv2.line(frame_rgb, (cx, cy - 18), (cx, cy + 18), color, 1)
+
+            label = "OK" if not too_close else "Move back / re-centre"
+            cv2.putText(frame_rgb, label, (face.left(), face.bottom() + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+
+        # HUD
+        cv2.putText(frame_rgb, f"FPS: {self._fps:.1f}", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.putText(frame_rgb, f"Faces: {len(faces)}", (10, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+        # Display in QLabel
+        h, w, ch = frame_rgb.shape
+        qimg = QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        self.camera_label.setPixmap(
+            QPixmap.fromImage(qimg).scaled(
+                self.camera_label.width(),
+                self.camera_label.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    # =========================================================================
+    # Registration actions
+    # =========================================================================
+
+    def _enforce_numeric_id(self, text: str) -> None:
+        """Strip non-digit characters from the ID field."""
+        cleaned = "".join(c for c in text if c.isdigit())
+        if cleaned != text:
+            self.id_entry.blockSignals(True)
+            self.id_entry.setText(cleaned)
+            self.id_entry.blockSignals(False)
+
+    def _refresh_face_count(self) -> None:
         try:
-            os.makedirs(self.current_face_dir, exist_ok=True)
-            self.log_message(f"Created folder: {self.current_face_dir}")
-            
-            # Count existing images in folder
-            existing_files = [f for f in os.listdir(self.current_face_dir) 
-                            if f.startswith("face_") and f.endswith(".jpg")]
-            self.ss_cnt = len(existing_files)
-            
+            folders = [
+                d for d in os.listdir(self.PATH_PHOTOS)
+                if os.path.isdir(os.path.join(self.PATH_PHOTOS, d))
+                and d.startswith("person_")
+            ]
+            self.existing_faces_cnt = len(folders)
+            self.db_count_label.setText(str(self.existing_faces_cnt))
+        except Exception as e:
+            self._log(f"Count error: {e}", error=True)
+
+    def _create_face_folder(self) -> None:
+        pid  = self.id_entry.text().strip()
+        name = self.name_entry.text().strip()
+        if not pid:
+            QMessageBox.warning(self, "Input Required", "Please enter a numeric ID.")
+            return
+        if not name:
+            QMessageBox.warning(self, "Input Required", "Please enter the person's full name.")
+            return
+
+        clean_name = "".join(c if c.isalnum() else "_" for c in name)
+        folder_path = os.path.join(self.PATH_PHOTOS, f"person_{pid}_{clean_name}")
+
+        try:
+            os.makedirs(folder_path, exist_ok=True)
+            self.current_face_dir = folder_path
+            # Count existing captures (resume-friendly)
+            self.ss_cnt = len([
+                f for f in os.listdir(folder_path)
+                if f.startswith("face_") and f.endswith(".jpg")
+            ])
             self.face_folder_created_flag = True
-            self.capture_btn['state'] = 'normal'
-            self.check_existing_faces_cnt()
-            
-            messagebox.showinfo(
-                "Success", 
-                f"Folder created for {person_name} (ID: {person_id}).\n"
-                f"You can now capture face images.")
-                
+            self.capture_btn.setEnabled(True)
+            self.capture_count_label.setText(f"Captured: {self.ss_cnt} images")
+            self._refresh_face_count()
+            self._log(f"Folder ready: {folder_path}")
+            QMessageBox.information(
+                self, "Ready",
+                f"Person folder created for {name} (ID {pid}).\n"
+                f"Press Space or the Capture button to record face images.",
+            )
         except Exception as e:
-            self.log_message(f"Error creating folder: {str(e)}", error=True)
-            messagebox.showerror(
-                "Error", 
-                f"Could not create folder:\n{str(e)}")
+            self._log(f"Folder creation failed: {e}", error=True)
+            QMessageBox.critical(self, "Error", str(e))
 
-    def save_current_face(self):
-        """Save the current face image"""
+    def _save_current_face(self) -> None:
         if not self.face_folder_created_flag:
-            messagebox.showwarning(
-                "No Folder", 
-                "Please create a person folder first.")
+            QMessageBox.warning(self, "No Folder", "Create a person folder first.")
             return
-            
-        if self.current_frame_faces_cnt != 1:
-            if self.current_frame_faces_cnt == 0:
-                message = "No face detected in frame."
-            else:
-                message = "Multiple faces detected. Please ensure only one face is visible."
-            messagebox.showwarning("Cannot Save", message)
+        if self.current_frame is None:
             return
-            
+        if self.current_frame_faces_cnt == 0:
+            QMessageBox.warning(self, "No Face", "No face detected in frame.")
+            return
+        if self.current_frame_faces_cnt > 1:
+            QMessageBox.warning(self, "Multiple Faces",
+                                "Only one face should be visible when capturing.")
+            return
         if self.out_of_range_flag:
-            messagebox.showwarning(
-                "Position Error", 
-                "Face is too close to edge of frame.\n"
-                "Please center the face in the frame.")
+            QMessageBox.warning(self, "Position",
+                                "Face is too close to the edge — please centre it.")
             return
-            
-        # Generate filename with timestamp
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"face_{timestamp}_{self.ss_cnt + 1}.jpg"
+        filename  = f"face_{timestamp}_{self.ss_cnt + 1}.jpg"
         save_path = os.path.join(self.current_face_dir, filename)
-        
+
         try:
-            # Get face region with some padding
-            padding = 20  # pixels around face
-            x1 = max(0, self.face_ROI_width_start - padding)
-            y1 = max(0, self.face_ROI_height_start - padding)
-            x2 = min(self.current_frame.shape[1], self.face_ROI_width_start + self.face_ROI_width + padding)
-            y2 = min(self.current_frame.shape[0], self.face_ROI_height_start + self.face_ROI_height + padding)
-            
-            # Extract and save face
-            face_img = self.current_frame[y1:y2, x1:x2]
-            cv2.imwrite(save_path, cv2.cvtColor(face_img, cv2.COLOR_RGB2BGR))
-            
+            pad = 20
+            x1  = max(0, self._face_left  - pad)
+            y1  = max(0, self._face_top   - pad)
+            x2  = min(self.current_frame.shape[1], self._face_left  + self._face_width  + pad)
+            y2  = min(self.current_frame.shape[0], self._face_top   + self._face_height + pad)
+            roi = self.current_frame[y1:y2, x1:x2]
+            cv2.imwrite(save_path, cv2.cvtColor(roi, cv2.COLOR_RGB2BGR))
             self.ss_cnt += 1
-            self.log_message(f"Saved face image: {filename}")
-            
-            # Visual feedback
-            self.warning_label['text'] = "FACE SAVED!"
-            self.warning_label['foreground'] = 'green'
-            self.win.after(1000, lambda: self.warning_label.config(text=""))
-            
+            self.capture_count_label.setText(f"Captured: {self.ss_cnt} images")
+            self._log(f"Saved: {filename}")
+            self.warning_label.setText("✓  Image saved!")
+            self.warning_label.setStyleSheet("color:green; font-weight:bold;")
+            QTimer.singleShot(1500, lambda: (
+                self.warning_label.setText(""),
+                self.warning_label.setStyleSheet("color:red; font-weight:bold;"),
+            ))
         except Exception as e:
-            self.log_message(f"Error saving face: {str(e)}", error=True)
-            messagebox.showerror("Save Error", f"Could not save image:\n{str(e)}")
+            self._log(f"Save error: {e}", error=True)
+            QMessageBox.critical(self, "Save Error", str(e))
 
-    def get_frame(self):
-        """Capture frame from camera with error handling"""
-        if not self.cap:
-            return False, None
-            
-        try:
-            ret, frame = self.cap.read()
-            if ret:
-                frame = cv2.resize(frame, (640, 480))
-                return ret, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            return ret, None
-        except Exception as e:
-            self.log_message(f"Camera error: {str(e)}", error=True)
-            return False, None
-
-    def process(self):
-        """Main processing loop for face detection"""
-        if not self.cap:
+    def _clear_data(self) -> None:
+        reply = QMessageBox.question(
+            self, "Confirm",
+            "Delete ALL registered face data and the features CSV?\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
-            
-        ret, self.current_frame = self.get_frame()
-        
-        if ret and self.current_frame is not None:
-            self.update_fps()
-            
-            # Detect faces using dlib
-            faces = detector(self.current_frame, 0)
-            self.current_frame_faces_cnt = len(faces)
-            self.face_count_label['text'] = str(self.current_frame_faces_cnt)
-            
-            self.out_of_range_flag = False
-            
-            # Draw face rectangles
-            if faces:
-                for face in faces:
-                    # Get face coordinates
-                    self.face_ROI_width_start = face.left()
-                    self.face_ROI_height_start = face.top()
-                    self.face_ROI_width = face.width()
-                    self.face_ROI_height = face.height()
-                    
-                    # Check if face is too close to edge
-                    margin = 20
-                    if (face.left() < margin or face.right() > (640 - margin) or
-                        face.top() < margin or face.bottom() > (480 - margin)):
-                        self.out_of_range_flag = True
-                        color = (255, 0, 0)  # Red for out of range
-                        thickness = 2
-                    else:
-                        color = (255, 255, 255)  # White for in range
-                        thickness = 2
-                    
-                    # Draw square around face (with equal width/height)
-                    size = max(face.width(), face.height())
-                    center_x = face.left() + face.width() // 2
-                    center_y = face.top() + face.height() // 2
-                    
-                    # Draw outer white square
-                    cv2.rectangle(
-                        self.current_frame,
-                        (center_x - size//2 - 5, center_y - size//2 - 5),
-                        (center_x + size//2 + 5, center_y + size//2 + 5),
-                        (255, 255, 255), thickness)
-                    
-                    # Draw inner red square
-                    cv2.rectangle(
-                        self.current_frame,
-                        (center_x - size//2, center_y - size//2),
-                        (center_x + size//2, center_y + size//2),
-                        color, thickness)
-                    
-                    # Add crosshair for precise alignment
-                    cv2.line(
-                        self.current_frame,
-                        (center_x - 15, center_y),
-                        (center_x + 15, center_y),
-                        color, 1)
-                    cv2.line(
-                        self.current_frame,
-                        (center_x, center_y - 15),
-                        (center_x, center_y + 15),
-                        color, 1)
-            
-            # Update warning label
-            if self.out_of_range_flag:
-                self.warning_label['text'] = "MOVE FACE TO CENTER"
-                self.warning_label['foreground'] = 'red'
-            else:
-                self.warning_label['text'] = ""
-            
-            # Update camera display
-            img = Image.fromarray(self.current_frame)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.camera_label.imgtk = imgtk
-            self.camera_label.configure(image=imgtk)
-        
-        # Schedule next frame processing
-        self.win.after(20, self.process)
-
-    def clear_data(self):
-        """Clear all registered face data"""
-        if not messagebox.askyesno(
-            "Confirm Clear", 
-            "This will permanently delete ALL registered face data.\n"
-            "Are you sure you want to continue?"):
-            return
-            
         try:
-            # Delete all person folders
-            for item in os.listdir(self.path_photos_from_camera):
-                path = os.path.join(self.path_photos_from_camera, item)
-                if os.path.isdir(path) and item.startswith("person_"):
-                    shutil.rmtree(path)
-            
-            # Reset state
-            self.current_face_dir = None
-            self.face_folder_created_flag = False
-            self.capture_btn['state'] = 'disabled'
-            self.id_entry.delete(0, tk.END)
-            self.name_entry.delete(0, tk.END)
-            self.ss_cnt = 0
-            
-            self.check_existing_faces_cnt()
-            self.log_message("Cleared all registered face data.")
-            messagebox.showinfo("Success", "All registered face data has been deleted.")
-            
+            if os.path.exists(self.PATH_PHOTOS):
+                shutil.rmtree(self.PATH_PHOTOS)
+            os.makedirs(self.PATH_PHOTOS, exist_ok=True)
+            csv_path = "data/features_all.csv"
+            if os.path.exists(csv_path):
+                os.remove(csv_path)
+            self.existing_faces_cnt = 0
+            self.db_count_label.setText("0")
+            self._log("All face data cleared.")
         except Exception as e:
-            self.log_message(f"Error clearing data: {str(e)}", error=True)
-            messagebox.showerror("Error", f"Could not clear data:\n{str(e)}")
+            self._log(f"Clear error: {e}", error=True)
 
-    def close_app(self):
-        """Cleanup and close application"""
-        self.log_message("Closing application...")
+    # =========================================================================
+    # Logging
+    # =========================================================================
+
+    def _log(self, message: str, error: bool = False) -> None:
+        ts    = time.strftime("%H:%M:%S")
+        color = "red" if error else "#222"
+        self.log_text.append(
+            f'<span style="color:{color}">[{ts}] {message}</span>'
+        )
+        sb = self.log_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        logger.info(message)
+
+    # =========================================================================
+    # Qt overrides
+    # =========================================================================
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Space:
+            self._save_current_face()
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self._timer.stop()
         if self.cap:
             self.cap.release()
-        self.win.destroy()
+        event.accept()
 
-    def run(self):
-        """Start the application"""
-        if self.cap:
-            self.process()
-        self.win.mainloop()
 
-def main():
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        filename='face_register.log',
-        filemode='a')
-    
-    # Also log to console
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    logging.getLogger().addHandler(console_handler)
-    
-    # Create and run application
-    app = FaceRegisterApp()
-    app.run()
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
+def main() -> None:
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = FaceRegisterApp()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
     main()

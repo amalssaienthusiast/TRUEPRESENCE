@@ -1,3 +1,17 @@
+"""
+attendance_taker.py — Face Recognition + Anti-Spoofing Attendance System (PyQt6)
+
+Anti-spoofing layers
+--------------------
+1. Eye-Blink Detection    — Eye Aspect Ratio (EAR) < threshold triggers blink
+2. Motion Analysis        — landmark variance over N frames detects live motion
+3. Texture Analysis       — HOG descriptor variance rejects static photos/screens
+4. Challenge-Response     — user must BLINK or NOD within a time window
+5. Composite Liveness     — smoothed score ≥ 50 required to mark VALID attendance
+
+Attendance is recorded to PostgreSQL (via database.py / docker-compose).
+"""
+
 import dlib
 import numpy as np
 import cv2
@@ -5,733 +19,857 @@ import os
 import pandas as pd
 import time
 import logging
-import sqlite3
 import datetime
 import random
+import sys
 from scipy.spatial import distance as dist
 from collections import deque
-import tkinter as tk
-from PIL import Image, ImageTk
-import threading
 
-# Dlib / Use frontal face detector of Dlib
-detector = dlib.get_frontal_face_detector()
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QSizePolicy,
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QImage, QPixmap, QFont, QColor
 
-# Dlib landmark / Get face landmarks
-predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+from database import init_db, record_attendance
 
-# Dlib Resnet Use Dlib resnet50 model to get 128D face descriptor
-face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+# ---------------------------------------------------------------------------
+# macOS AVFoundation: skip OpenCV's built-in auth request — the app opens
+# the camera on the main thread, which is the correct place to trigger the
+# macOS permission dialog.
+# ---------------------------------------------------------------------------
+import os as _os
+_os.environ.setdefault("OPENCV_AVFOUNDATION_SKIP_AUTH", "1")
 
-# Define eye landmarks indices
-(LEFT_EYE_START, LEFT_EYE_END) = (42, 48)
-(RIGHT_EYE_START, RIGHT_EYE_END) = (36, 42)
+# ---------------------------------------------------------------------------
+# dlib models
+# ---------------------------------------------------------------------------
+detector      = dlib.get_frontal_face_detector()
+predictor     = dlib.shape_predictor("data/data_dlib/shape_predictor_68_face_landmarks.dat")
+face_reco_model = dlib.face_recognition_model_v1(
+    "data/data_dlib/dlib_face_recognition_resnet_model_v1.dat"
+)
 
-# Constants for blink detection
-EYE_AR_THRESH = 0.3
-EYE_AR_CONSEC_FRAMES = 1
-BLINK_REQUIRED = True
+# ---------------------------------------------------------------------------
+# Eye landmark indices
+# ---------------------------------------------------------------------------
+LEFT_EYE_START,  LEFT_EYE_END  = 42, 48
+RIGHT_EYE_START, RIGHT_EYE_END = 36, 42
 
-# Anti-spoofing constants
-FACIAL_LANDMARKS_IDXS = {
-    "mouth": (48, 68),
-    "right_eyebrow": (17, 22),
-    "left_eyebrow": (22, 27),
-    "right_eye": (36, 42),
-    "left_eye": (42, 48),
-    "nose": (27, 35),
-    "jaw": (0, 17)
-}
-LBP_POINTS = 24
-LBP_RADIUS = 3
-MOTION_FRAMES = 10
-MOTION_THRESHOLD = 0.05
-CHALLENGE_ACTIVE = True
-CHALLENGE_TYPES = ["BLINK", "NOD"]
+# ---------------------------------------------------------------------------
+# Anti-spoofing / liveness constants
+# ---------------------------------------------------------------------------
+EYE_AR_THRESH        = 0.30   # EAR below this → blink
+EYE_AR_CONSEC_FRAMES = 1      # consecutive frames required
+BLINK_REQUIRED       = False  # set True to enforce blink before VALID
+
+MOTION_FRAMES     = 10
+MOTION_THRESHOLD  = 0.05
+CHALLENGE_ACTIVE  = True
+CHALLENGE_TYPES   = ["BLINK", "NOD"]
 CHALLENGE_DURATION = 50
 
-# Create a connection to the database
-conn = sqlite3.connect("attendance.db")
-cursor = conn.cursor()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-# Check if attendance table exists
-cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='attendance'")
-table_exists = cursor.fetchone()
 
-if table_exists:
-    cursor.execute("PRAGMA table_info(attendance)")
-    columns = cursor.fetchall()
-    status_column_exists = any(column[1] == 'status' for column in columns)
-    if not status_column_exists:
-        cursor.execute("ALTER TABLE attendance ADD COLUMN status TEXT")
-        print("Added 'status' column to existing attendance table")
-else:
-    current_date = datetime.datetime.now().strftime("%Y_%m_%d")
-    table_name = "attendance"
-    create_table_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (name TEXT, time TEXT, date DATE, status TEXT, UNIQUE(name, date))"
-    cursor.execute(create_table_sql)
-
-conn.commit()
-conn.close()
-
+# ===========================================================================
+# Core face-recognition & anti-spoofing engine
+# ===========================================================================
 
 class Face_Recognizer:
-    def __init__(self):
-        self.font = cv2.FONT_HERSHEY_SIMPLEX
-        self.frame_time = 0
-        self.frame_start_time = 0
-        self.fps = 0
-        self.fps_show = 0
-        self.start_time = time.time()
-        self.frame_cnt = 0
-        self.face_features_known_list = []
-        self.face_name_known_list = []
-        self.last_frame_face_centroid_list = []
-        self.current_frame_face_centroid_list = []
-        self.last_frame_face_name_list = []
-        self.current_frame_face_name_list = []
-        self.last_frame_face_cnt = 0
-        self.current_frame_face_cnt = 0
-        self.current_frame_face_X_e_distance_list = []
-        self.current_frame_face_position_list = []
-        self.current_frame_face_feature_list = []
+    """Handles face detection, recognition, liveness analysis and attendance."""
+
+    def __init__(self) -> None:
+        self.font              = cv2.FONT_HERSHEY_SIMPLEX
+        self.frame_cnt         = 0
+        self.fps               = 0.0
+        self._frame_start      = time.time()
+
+        # Known faces loaded from CSV
+        self.face_features_known_list: list = []
+        self.face_name_known_list:     list = []
+
+        # Per-frame tracking
+        self.last_frame_face_centroid_list:  list = []
+        self.current_frame_face_centroid_list: list = []
+        self.last_frame_face_name_list:      list = []
+        self.current_frame_face_name_list:   list = []
+        self.last_frame_face_cnt             = 0
+        self.current_frame_face_cnt          = 0
+        self.current_frame_face_X_e_distance_list: list = []
+        self.current_frame_face_position_list:     list = []
+        self.current_frame_face_feature_list:      list = []
         self.last_current_frame_centroid_e_distance = 0
         self.reclassify_interval_cnt = 0
-        self.reclassify_interval = 10
-        self.eye_counter = 0
-        self.total_blinks = 0
-        self.blink_detected = False
-        self.person_blink_status = {}
-        self.face_motion_history = {}
-        self.liveness_scores = {}
-        self.spoof_detected = {}
-        self.current_challenges = {}
-        self.challenge_progress = {}
-        self.challenge_complete = {}
-        self.prev_landmarks = {}
+        self.reclassify_interval     = 10
 
-    def eye_aspect_ratio(self, eye):
+        # Blink state
+        self.eye_counter    = 0
+        self.total_blinks   = 0
+        self.blink_detected = False
+
+        # Per-person state
+        self.person_blink_status: dict[str, bool]  = {}
+        self.face_motion_history:  dict             = {}
+        self.liveness_scores:      dict[str, float] = {}
+        self.spoof_detected:       dict[str, bool]  = {}
+        self.current_challenges:   dict[str, str]   = {}
+        self.challenge_progress:   dict[str, int]   = {}
+        self.challenge_complete:   dict[str, bool]  = {}
+        self.prev_landmarks:       dict             = {}
+
+    # ── eye aspect ratio ───────────────────────────────────────────────────
+
+    def eye_aspect_ratio(self, eye: list) -> float:
         A = dist.euclidean(eye[1], eye[5])
         B = dist.euclidean(eye[2], eye[4])
         C = dist.euclidean(eye[0], eye[3])
-        ear = (A + B) / (2.0 * C)
-        return ear
+        return (A + B) / (2.0 * C)
 
     def get_eyes(self, shape):
-        leftEye = []
-        rightEye = []
-        for i in range(LEFT_EYE_START, LEFT_EYE_END):
-            leftEye.append((shape.part(i).x, shape.part(i).y))
-        for i in range(RIGHT_EYE_START, RIGHT_EYE_END):
-            rightEye.append((shape.part(i).x, shape.part(i).y))
-        return leftEye, rightEye
+        left  = [(shape.part(i).x, shape.part(i).y) for i in range(LEFT_EYE_START,  LEFT_EYE_END)]
+        right = [(shape.part(i).x, shape.part(i).y) for i in range(RIGHT_EYE_START, RIGHT_EYE_END)]
+        return left, right
 
     def detect_blink(self, shape):
-        leftEye, rightEye = self.get_eyes(shape)
-        leftEAR = self.eye_aspect_ratio(leftEye)
-        rightEAR = self.eye_aspect_ratio(rightEye)
-        ear = (leftEAR + rightEAR) / 2.0
+        left, right = self.get_eyes(shape)
+        ear = (self.eye_aspect_ratio(left) + self.eye_aspect_ratio(right)) / 2.0
         if ear < EYE_AR_THRESH:
             self.eye_counter += 1
             if self.eye_counter >= EYE_AR_CONSEC_FRAMES:
                 self.total_blinks += 1
                 self.blink_detected = True
         else:
-            if self.eye_counter > 0:
-                self.eye_counter = 0
-        return self.blink_detected, ear, leftEye, rightEye
+            self.eye_counter = 0
+        return self.blink_detected, ear, left, right
 
-    def get_face_database(self):
-        if os.path.exists("data/features_all.csv"):
-            path_features_known_csv = "data/features_all.csv"
-            csv_rd = pd.read_csv(path_features_known_csv, header=None)
-            for i in range(csv_rd.shape[0]):
-                features_someone_arr = []
-                self.face_name_known_list.append(csv_rd.iloc[i][0])
-                for j in range(1, 129):
-                    if csv_rd.iloc[i][j] == '':
-                        features_someone_arr.append('0')
-                    else:
-                        features_someone_arr.append(csv_rd.iloc[i][j])
-                self.face_features_known_list.append(features_someone_arr)
-            logging.info("Faces in Database： %d", len(self.face_features_known_list))
-            return 1
-        else:
-            logging.warning("'features_all.csv' not found!")
-            return 0
+    # ── feature database ───────────────────────────────────────────────────
 
-    def update_fps(self):
-        now = time.time()
-        if str(self.start_time).split(".")[0] != str(now).split(".")[0]:
-            self.fps_show = self.fps
-        self.start_time = now
-        self.frame_time = now - self.frame_start_time
-        self.fps = 1.0 / self.frame_time if self.frame_time > 0 else 0
-        self.frame_start_time = now
+    def get_face_database(self) -> bool:
+        csv_path = "data/features_all.csv"
+        if not os.path.exists(csv_path):
+            logger.warning("'features_all.csv' not found — run feature extraction first.")
+            return False
+        try:
+            df = pd.read_csv(csv_path, header=None)
+            for i in range(df.shape[0]):
+                self.face_name_known_list.append(df.iloc[i][0])
+                feats = [str(df.iloc[i][j]) if df.iloc[i][j] != "" else "0" for j in range(1, 129)]
+                self.face_features_known_list.append(feats)
+            logger.info("Faces in database: %d", len(self.face_features_known_list))
+            return True
+        except pd.errors.EmptyDataError:
+            logger.warning("'features_all.csv' is empty.")
+            return False
+
+    # ── matching ──────────────────────────────────────────────────────────
 
     @staticmethod
-    def return_euclidean_distance(feature_1, feature_2):
-        feature_1 = np.array(feature_1)
-        feature_2 = np.array(feature_2)
-        dist = np.sqrt(np.sum(np.square(feature_1 - feature_2)))
-        return dist
+    def euclidean(f1, f2) -> float:
+        a = np.array(f1, dtype=float)
+        b = np.array(f2, dtype=float)
+        return float(np.sqrt(np.sum((a - b) ** 2)))
 
-    def centroid_tracker(self):
-        for i in range(len(self.current_frame_face_centroid_list)):
-            e_distance_current_frame_person_x_list = []
-            for j in range(len(self.last_frame_face_centroid_list)):
-                self.last_current_frame_centroid_e_distance = self.return_euclidean_distance(
-                    self.current_frame_face_centroid_list[i], self.last_frame_face_centroid_list[j])
-                e_distance_current_frame_person_x_list.append(
-                    self.last_current_frame_centroid_e_distance)
-            last_frame_num = e_distance_current_frame_person_x_list.index(
-                min(e_distance_current_frame_person_x_list))
-            self.current_frame_face_name_list[i] = self.last_frame_face_name_list[last_frame_num]
+    def centroid_tracker(self) -> None:
+        for i, curr_c in enumerate(self.current_frame_face_centroid_list):
+            dists = [self.euclidean(curr_c, last_c)
+                     for last_c in self.last_frame_face_centroid_list]
+            self.current_frame_face_name_list[i] = \
+                self.last_frame_face_name_list[dists.index(min(dists))]
 
-    def draw_note(self, img_rd):
-        cv2.putText(img_rd, "Face Recognition", (20, 40), self.font, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
-        for i in range(len(self.current_frame_face_name_list)):
-            img_rd = cv2.putText(img_rd, "Face_" + str(i + 1), tuple(
-                [int(self.current_frame_face_centroid_list[i][0]), int(self.current_frame_face_centroid_list[i][1])]),
-                                 self.font, 0.8, (255, 190, 0), 1, cv2.LINE_AA)
+    # ── FPS ───────────────────────────────────────────────────────────────
 
-    def attendance(self, name):
-        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-        conn = sqlite3.connect("attendance.db")
-        cursor = conn.cursor()
-        is_live = self.liveness_scores.get(name, 0) >= 50
-        has_blinked = self.person_blink_status.get(name, False)
-        if self.blink_detected:
-            self.person_blink_status[name] = True
-            has_blinked = True
-            print(f"Blink detected for {name}!")
-        spoof_detected = self.spoof_detected.get(name, False)
-        if spoof_detected:
-            status = "INVALID - SPOOFING DETECTED"
-            print(f"WARNING: {name} attempted to use a fake face! Marking as INVALID.")
-        elif BLINK_REQUIRED and not has_blinked:
-            status = "INVALID - User is NOT Blinking the EYES."
-            print(f"WARNING: {name} tried to mark attendance without blinking!")
-        elif CHALLENGE_ACTIVE and not self.challenge_complete.get(name, False):
-            status = "INVALID - Challenge Not Completed"
-            print(f"WARNING: {name} did not complete the verification challenge!")
-        elif not is_live:
-            status = "INVALID - Failed Liveness Check"
-            print(f"WARNING: {name} failed the liveness check!")
-        else:
-            status = "VALID"
-        cursor.execute("SELECT * FROM attendance WHERE name = ? AND date = ?", (name, current_date))
-        existing_entry = cursor.fetchone()
-        if existing_entry:
-            existing_status = existing_entry[3] if len(existing_entry) > 3 and existing_entry[3] is not None else "UNKNOWN"
-            if (existing_status != "VALID" and status == "VALID") or has_blinked:
-                current_time = datetime.datetime.now().strftime('%H:%M:%S')
-                if has_blinked:
-                    status = "VALID"
-                cursor.execute("UPDATE attendance SET time = ?, status = ? WHERE name = ? AND date = ?",
-                              (current_time, status, name, current_date))
-                conn.commit()
-                print(f"{name} attendance updated to {status} for {current_date} at {current_time}")
-            else:
-                print(f"{name} is already marked as present for {current_date}")
-        else:
-            current_time = datetime.datetime.now().strftime('%H:%M:%S')
-            cursor.execute("INSERT INTO attendance (name, time, date, status) VALUES (?, ?, ?, ?)",
-                          (name, current_time, current_date, status))
-            conn.commit()
-            print(f"{name} marked as present for {current_date} at {current_time} - Status: {status}")
-        conn.close()
+    def update_fps(self) -> None:
+        now = time.time()
+        dt  = now - self._frame_start
+        self.fps = 1.0 / dt if dt > 0 else 0
+        self._frame_start = now
 
-    def get_texture_features(self, image):
-        small_img = cv2.resize(image, (64, 64))
-        gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
-        h = cv2.HOGDescriptor((64, 64), (16, 16), (8, 8), (8, 8), 9)
-        descriptors = h.compute(gray)
-        return descriptors
+    # ── texture analysis ──────────────────────────────────────────────────
 
-    def analyze_face_texture(self, image):
-        if image.size == 0 or image.shape[0] < 20 or image.shape[1] < 20:
-            return 0, False
+    def analyze_face_texture(self, face_roi: np.ndarray):
+        if face_roi.size == 0 or face_roi.shape[0] < 20 or face_roi.shape[1] < 20:
+            return 0.0, False
         try:
-            descriptors = self.get_texture_features(image)
-            texture_variance = np.var(descriptors)
-            texture_score = texture_variance * 1000
-            is_real = texture_score > 0.5
-            return texture_score, is_real
+            small = cv2.resize(face_roi, (64, 64))
+            gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            hog   = cv2.HOGDescriptor((64, 64), (16, 16), (8, 8), (8, 8), 9)
+            desc  = hog.compute(gray)
+            var   = float(np.var(desc))
+            score = var * 1000
+            return score, score > 0.5
         except Exception as e:
-            logging.error(f"Texture analysis error: {e}")
-            return 0, False
+            logger.debug("Texture analysis error: %s", e)
+            return 0.0, False
 
-    def analyze_face_motion(self, face_id, shape):
-        landmarks = []
-        for i in range(36, 48):
-            landmarks.append((shape.part(i).x, shape.part(i).y))
-        landmarks.append((shape.part(30).x, shape.part(30).y))
-        landmarks = np.array(landmarks)
+    # ── motion analysis ───────────────────────────────────────────────────
+
+    def analyze_face_motion(self, face_id: str, shape):
+        pts = np.array(
+            [(shape.part(i).x, shape.part(i).y) for i in range(36, 48)] +
+            [(shape.part(30).x, shape.part(30).y)],
+            dtype=float,
+        )
         if face_id not in self.face_motion_history:
             self.face_motion_history[face_id] = deque(maxlen=MOTION_FRAMES)
-            self.prev_landmarks[face_id] = landmarks
-            return 0, False
-        if face_id in self.prev_landmarks:
-            motion = np.mean(np.linalg.norm(landmarks - self.prev_landmarks[face_id], axis=1))
-            self.face_motion_history[face_id].append(motion)
-            self.prev_landmarks[face_id] = landmarks
-            if len(self.face_motion_history[face_id]) >= MOTION_FRAMES // 2:
-                avg_motion = np.mean(self.face_motion_history[face_id])
-                motion_variance = np.var(self.face_motion_history[face_id])
-                is_real_motion = avg_motion > MOTION_THRESHOLD and motion_variance > 0.01
-                is_video_loop = motion_variance < 0.001 and len(self.face_motion_history[face_id]) == MOTION_FRAMES
-                return avg_motion, is_real_motion and not is_video_loop
-        return 0, False
+            self.prev_landmarks[face_id] = pts
+            return 0.0, False
+        prev = self.prev_landmarks[face_id]
+        motion = float(np.mean(np.linalg.norm(pts - prev, axis=1)))
+        self.face_motion_history[face_id].append(motion)
+        self.prev_landmarks[face_id] = pts
 
-    def generate_challenge(self, face_id):
+        if len(self.face_motion_history[face_id]) >= MOTION_FRAMES // 2:
+            history   = list(self.face_motion_history[face_id])
+            avg       = float(np.mean(history))
+            variance  = float(np.var(history))
+            is_loop   = variance < 0.001 and len(history) == MOTION_FRAMES
+            is_real   = avg > MOTION_THRESHOLD and variance > 0.01 and not is_loop
+            return avg, is_real
+        return 0.0, False
+
+    # ── challenge-response ────────────────────────────────────────────────
+
+    def generate_challenge(self, face_id: str) -> str:
         if not CHALLENGE_ACTIVE:
             return "NONE"
         if face_id not in self.current_challenges:
-            challenge = random.choice(CHALLENGE_TYPES)
-            self.current_challenges[face_id] = challenge
-            self.challenge_progress[face_id] = 0
-            self.challenge_complete[face_id] = False
-            return challenge
+            self.current_challenges[face_id]  = random.choice(CHALLENGE_TYPES)
+            self.challenge_progress[face_id]  = 0
+            self.challenge_complete[face_id]  = False
         return self.current_challenges[face_id]
 
-    def detect_nod(self, face_id, shape):
+    def detect_nod(self, face_id: str, shape) -> tuple[bool, float]:
         nose_tip = (shape.part(30).x, shape.part(30).y)
-        if f"{face_id}_nose_positions" not in self.__dict__:
-            self.__dict__[f"{face_id}_nose_positions"] = deque(maxlen=5)
-            self.__dict__[f"{face_id}_nose_positions"].append(nose_tip)
-            self.__dict__[f"{face_id}_nod_detected"] = False
-            self.__dict__[f"{face_id}_initial_nose_pos"] = nose_tip
-            return False, 0
-        self.__dict__[f"{face_id}_nose_positions"].append(nose_tip)
-        initial_pos = self.__dict__[f"{face_id}_initial_nose_pos"]
-        positions = self.__dict__[f"{face_id}_nose_positions"]
-        vert_diffs = [pos[1] - initial_pos[1] for pos in positions]
-        if len(vert_diffs) >= 4:
-            direction_changes = 0
-            for i in range(1, len(vert_diffs)):
-                if (vert_diffs[i] > 0 and vert_diffs[i-1] < 0) or (vert_diffs[i] < 0 and vert_diffs[i-1] > 0):
-                    direction_changes += 1
-            max_movement = max(vert_diffs) - min(vert_diffs)
-            self.__dict__[f"{face_id}_nod_detected"] = direction_changes >= 1 and max_movement > 5
-            return self.__dict__[f"{face_id}_nod_detected"], max_movement
-        return False, 0
+        key = f"{face_id}__nose_pos"
+        if key not in self.__dict__:
+            self.__dict__[key] = deque(maxlen=5)
+            self.__dict__[f"{face_id}__init_nose"] = nose_tip
+        self.__dict__[key].append(nose_tip)
+        init = self.__dict__[f"{face_id}__init_nose"]
+        diffs = [p[1] - init[1] for p in self.__dict__[key]]
+        if len(diffs) >= 4:
+            changes = sum(
+                1 for i in range(1, len(diffs))
+                if (diffs[i] > 0) != (diffs[i - 1] > 0)
+            )
+            movement = max(diffs) - min(diffs)
+            return changes >= 1 and movement > 5, float(movement)
+        return False, 0.0
 
-    def check_challenge_response(self, face_id, shape):
-        challenge = self.current_challenges.get(face_id, "NONE")
+    def check_challenge_response(self, face_id: str, shape) -> bool:
+        challenge = self.generate_challenge(face_id)
         if challenge == "NONE":
             self.challenge_complete[face_id] = True
             return True
+        if self.challenge_complete.get(face_id, False):
+            return True
+
         progress = self.challenge_progress.get(face_id, 0)
         if challenge == "BLINK":
-            blink_detected, _, _, _ = self.detect_blink(shape)
-            if blink_detected:
+            blinked, _, _, _ = self.detect_blink(shape)
+            if blinked:
                 progress += 5
                 self.blink_detected = False
         elif challenge == "NOD":
-            nod_detected, _ = self.detect_nod(face_id, shape)
-            if nod_detected:
+            nodded, _ = self.detect_nod(face_id, shape)
+            if nodded:
                 progress += 5
+
         self.challenge_progress[face_id] = progress
         if progress >= 10:
             self.challenge_complete[face_id] = True
             return True
         return False
 
-    def detect_liveness(self, face_id, img_rd, d, shape):
+    # ── liveness composite score ──────────────────────────────────────────
+
+    def detect_liveness(self, face_id: str, img_rd: np.ndarray, d, shape):
         try:
-            face_roi = img_rd[max(0, d.top()):min(img_rd.shape[0], d.bottom()),
-                             max(0, d.left()):min(img_rd.shape[1], d.right())]
-            if face_roi.size == 0:
+            roi = img_rd[
+                max(0, d.top()): min(img_rd.shape[0], d.bottom()),
+                max(0, d.left()): min(img_rd.shape[1], d.right()),
+            ]
+            if roi.size == 0:
                 return False, "Invalid face region"
         except Exception as e:
-            logging.error(f"Face ROI extraction error: {e}")
-            return False, "Face detection error"
+            return False, f"ROI error: {e}"
+
         if face_id not in self.liveness_scores:
-            self.liveness_scores[face_id] = 0
-            self.spoof_detected[face_id] = False
-        liveness_score = 0
+            self.liveness_scores[face_id] = 0.0
+            self.spoof_detected[face_id]  = False
+
+        score         = 0.0
         spoof_reasons = []
-        challenge_complete = self.check_challenge_response(face_id, shape)
-        if challenge_complete:
-            liveness_score += 40
+
+        # 1. Challenge (20 pts)
+        challenge_ok = self.check_challenge_response(face_id, shape)
+        if challenge_ok:
+            score += 20
         else:
-            spoof_reasons.append(f"Challenge not completed")
-        if liveness_score < 40:
-            motion_score, is_real_motion = self.analyze_face_motion(face_id, shape)
-            if is_real_motion:
-                liveness_score += min(30, motion_score * 200)
+            spoof_reasons.append("Challenge incomplete")
+
+        # 2. Motion (max 40 pts)
+        motion_val, is_real_motion = self.analyze_face_motion(face_id, shape)
+        if is_real_motion:
+            score += min(40.0, motion_val * 200)
+        else:
+            spoof_reasons.append("Unnatural motion")
+
+        # 3. Texture (max 40 pts, checked every 5 frames to save CPU)
+        if self.frame_cnt % 5 == 0:
+            tex_score, is_real_tex = self.analyze_face_texture(roi)
+            if is_real_tex:
+                score += min(40.0, tex_score)
             else:
-                spoof_reasons.append("Unnatural motion")
-            if self.frame_cnt % 5 == 0:
-                texture_score, is_real_texture = self.analyze_face_texture(face_roi)
-                if is_real_texture:
-                    liveness_score += min(30, texture_score)
-                else:
-                    spoof_reasons.append("Fake texture detected")
-        alpha = 0.3
-        self.liveness_scores[face_id] = alpha * liveness_score + (1 - alpha) * self.liveness_scores.get(face_id, 0)
+                spoof_reasons.append("Fake texture")
+
+        # Exponential smoothing
+        alpha = 0.30
+        self.liveness_scores[face_id] = (
+            alpha * score + (1 - alpha) * self.liveness_scores[face_id]
+        )
+
         is_live = self.liveness_scores[face_id] >= 50
         if not is_live and self.frame_cnt > 30:
             self.spoof_detected[face_id] = True
-        spoof_message = ", ".join(spoof_reasons) if spoof_reasons else "No spoof detected"
-        return is_live, spoof_message
 
-    def process(self, stream, video_label, update_metrics_callback):
-        if self.get_face_database():
-            while stream.isOpened() and not hasattr(self, 'stop_thread'):
-                self.frame_cnt += 1
-                logging.debug("Frame " + str(self.frame_cnt) + " starts")
-                flag, img_rd = stream.read()
-                if not flag:
-                    break
-                faces = detector(img_rd, 0)
-                self.last_frame_face_cnt = self.current_frame_face_cnt
-                self.current_frame_face_cnt = len(faces)
-                self.last_frame_face_name_list = self.current_frame_face_name_list[:]
-                self.last_frame_face_centroid_list = self.current_frame_face_centroid_list
-                self.current_frame_face_centroid_list = []
-                if (self.current_frame_face_cnt == self.last_frame_face_cnt) and (
-                        self.reclassify_interval_cnt != self.reclassify_interval):
-                    logging.debug("scene 1: No face cnt changes in this frame!!!")
-                    self.current_frame_face_position_list = []
-                    if "unknown" in self.current_frame_face_name_list:
-                        self.reclassify_interval_cnt += 1
-                    if self.current_frame_face_cnt != 0:
-                        for k, d in enumerate(faces):
-                            self.current_frame_face_position_list.append(tuple(
-                                [d.left(), int(d.bottom() + (d.bottom() - d.top()) / 4)]))
-                            self.current_frame_face_centroid_list.append(
-                                [int(d.left() + d.right()) / 2, int(d.top() + d.bottom()) / 2])
-                            rect_color = (255, 255, 255)
-                            metrics = {}
-                            if self.current_frame_face_name_list[k] != "unknown":
-                                face_id = self.current_frame_face_name_list[k]
-                                shape = predictor(img_rd, d)
-                                blink_detected, ear, leftEye, rightEye = self.detect_blink(shape)
-                                is_live, spoof_message = self.detect_liveness(face_id, img_rd, d, shape)
-                                if is_live:
-                                    rect_color = (0, 255, 0)
-                                elif self.spoof_detected.get(face_id, False):
-                                    rect_color = (0, 0, 255)
-                                challenge = self.current_challenges.get(face_id, "NONE")
-                                progress = self.challenge_progress.get(face_id, 0)
-                                leftEyeHull = np.array(leftEye)
-                                rightEyeHull = np.array(rightEye)
-                                cv2.drawContours(img_rd, [leftEyeHull], -1, (0, 255, 0), 1)
-                                cv2.drawContours(img_rd, [rightEyeHull], -1, (0, 255, 0), 1)
-                                mouth_pts = []
-                                for i in range(48, 60):
-                                    mouth_pts.append((shape.part(i).x, shape.part(i).y))
-                                mouth_pts = np.array(mouth_pts)
-                                mar = 0
-                                if len(mouth_pts) > 0:
-                                    mouth_width = dist.euclidean(mouth_pts[0], mouth_pts[6])
-                                    mouth_height = dist.euclidean(mouth_pts[3], mouth_pts[9])
-                                    mar = mouth_height / max(mouth_width, 1e-6)
-                                nose_tip = (shape.part(30).x, shape.part(30).y)
-                                nose_bridge = (shape.part(27).x, shape.part(27).y)
-                                nose_length = dist.euclidean(nose_tip, nose_bridge)
-                                x_pos = d.right() + 10
-                                y_pos_start = d.top()
-                                line_space = 22
-                                cv2.putText(img_rd, f"Face ID: {face_id}", (x_pos, y_pos_start),
-                                            self.font, 0.7, rect_color, 1, cv2.LINE_AA)
-                                liveness_score = self.liveness_scores.get(face_id, 0)
-                                cv2.putText(img_rd, f"Liveness: {liveness_score:.1f}%",
-                                            (x_pos, y_pos_start + line_space * 1),
-                                            self.font, 0.6, rect_color, 1, cv2.LINE_AA)
-                                if blink_detected:
-                                    self.person_blink_status[face_id] = True
-                                    self.blink_detected = False
-                                blink_status = self.person_blink_status.get(face_id, False)
-                                status_color = (0, 255, 0) if blink_status else (0, 0, 255)
-                                cv2.putText(img_rd, f"Blinked: {blink_status}",
-                                            (x_pos, y_pos_start + line_space * 2),
-                                            self.font, 0.6, status_color, 1, cv2.LINE_AA)
-                                cv2.putText(img_rd, f"EAR: {ear:.2f}",
-                                            (x_pos, y_pos_start + line_space * 3),
-                                            self.font, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-                                cv2.putText(img_rd, f"MAR: {mar:.2f}",
-                                            (x_pos, y_pos_start + line_space * 4),
-                                            self.font, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-                                motion_score = 0
-                                if face_id in self.face_motion_history and len(self.face_motion_history[face_id]) > 0:
-                                    motion_score = np.mean(self.face_motion_history[face_id])
-                                cv2.putText(img_rd, f"Motion: {motion_score:.2f}",
-                                            (x_pos, y_pos_start + line_space * 5),
-                                            self.font, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-                                cv2.putText(img_rd, f"Nose L: {nose_length:.2f}",
-                                            (x_pos, y_pos_start + line_space * 6),
-                                            self.font, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
-                                if CHALLENGE_ACTIVE:
-                                    challenge_color = (0, 255, 0) if self.challenge_complete.get(face_id, False) else (0, 165, 255)
-                                    cv2.putText(img_rd, f"Challenge: {challenge} ({progress}/10)",
-                                                (x_pos, y_pos_start + line_space * 7),
-                                                self.font, 0.6, challenge_color, 1, cv2.LINE_AA)
-                                if not is_live:
-                                    cv2.putText(img_rd, f"ALERT: {spoof_message}",
-                                                (d.left(), d.bottom() + 25),
-                                                self.font, 0.7, (0, 0, 255), 1, cv2.LINE_AA)
-                                key_landmarks = [0, 8, 16, 27, 30, 36, 39, 42, 45, 48, 54]
-                                for i in key_landmarks:
-                                    point = (shape.part(i).x, shape.part(i).y)
-                                    cv2.circle(img_rd, point, 2, (0, 255, 255), -1)
-                                metrics = {
-                                    'face_id': face_id,
-                                    'liveness': liveness_score,
-                                    'blinked': blink_status,
-                                    'ear': ear,
-                                    'mar': mar,
-                                    'motion': motion_score,
-                                    'nose_length': nose_length,
-                                    'challenge': f"{challenge} ({progress}/10)",
-                                    'spoof_message': spoof_message if not is_live else "No spoof detected"
-                                }
-                            img_rd = cv2.rectangle(img_rd, tuple([d.left(), d.top()]),
-                                                   tuple([d.right(), d.bottom()]), rect_color, 2)
-                            update_metrics_callback(metrics)
-                    if self.current_frame_face_cnt != 1:
-                        self.centroid_tracker()
-                    for i in range(self.current_frame_face_cnt):
-                        img_rd = cv2.putText(img_rd, self.current_frame_face_name_list[i],
-                                             self.current_frame_face_position_list[i], self.font, 0.8, (0, 255, 255), 1,
-                                             cv2.LINE_AA)
-                    self.draw_note(img_rd)
+        msg = ", ".join(spoof_reasons) if spoof_reasons else "Live"
+        return is_live, msg
+
+    # ── attendance ────────────────────────────────────────────────────────
+
+    def attendance(self, name: str) -> None:
+        is_live   = self.liveness_scores.get(name, 0) >= 50
+        has_blink = self.person_blink_status.get(name, False)
+        spoof     = self.spoof_detected.get(name, False)
+
+        if self.blink_detected:
+            self.person_blink_status[name] = True
+            has_blink = True
+
+        if spoof:
+            status = "INVALID - SPOOFING DETECTED"
+            print(f"⚠  {name}: spoofing detected — INVALID")
+        elif BLINK_REQUIRED and not has_blink:
+            status = "INVALID - No Blink Detected"
+            print(f"⚠  {name}: no blink — INVALID")
+        elif CHALLENGE_ACTIVE and not self.challenge_complete.get(name, False) and not is_live:
+            status = "INVALID - Challenge Not Completed"
+            print(f"⚠  {name}: challenge not completed — INVALID")
+        elif not is_live:
+            status = "INVALID - Failed Liveness Check"
+            print(f"⚠  {name}: liveness failed — INVALID")
+        else:
+            status = "VALID"
+            print(f"✓  {name}: VALID attendance")
+
+        try:
+            result = record_attendance(name, status)
+            print(f"   DB: {result} — {status}")
+        except Exception as e:
+            logger.error("DB error recording attendance for %s: %s", name, e)
+
+    # ── OSD helpers ───────────────────────────────────────────────────────
+
+    def draw_note(self, img: np.ndarray) -> None:
+        cv2.putText(img, "Face Recognition + Anti-Spoofing",
+                    (10, 25), self.font, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # ── main processing loop ──────────────────────────────────────────────
+
+    def process(
+        self,
+        stream: cv2.VideoCapture,
+        frame_callback,           # callable(np.ndarray RGB)
+        metrics_callback,         # callable(dict, is_system_metrics=bool)
+    ) -> None:
+        if not self.get_face_database():
+            return
+
+        while stream.isOpened() and not getattr(self, "stop_thread", False):
+            self.frame_cnt += 1
+            ok, img_rd = stream.read()
+            if not ok:
+                break
+
+            faces = detector(img_rd, 0)
+            self.last_frame_face_cnt              = self.current_frame_face_cnt
+            self.current_frame_face_cnt           = len(faces)
+            self.last_frame_face_name_list        = self.current_frame_face_name_list[:]
+            self.last_frame_face_centroid_list    = self.current_frame_face_centroid_list
+            self.current_frame_face_centroid_list = []
+
+            same_cnt  = self.current_frame_face_cnt == self.last_frame_face_cnt
+            no_reclfy = self.reclassify_interval_cnt != self.reclassify_interval
+
+            if same_cnt and no_reclfy:
+                # ── scene 1: face count unchanged ────────────────────────────
+                self.current_frame_face_position_list = []
+                if "unknown" in self.current_frame_face_name_list:
+                    self.reclassify_interval_cnt += 1
+
+                for k, d in enumerate(faces):
+                    self.current_frame_face_centroid_list.append(
+                        [int((d.left() + d.right()) / 2), int((d.top() + d.bottom()) / 2)]
+                    )
+                    self.current_frame_face_position_list.append(
+                        (d.left(), int(d.bottom() + (d.bottom() - d.top()) / 4))
+                    )
+
+                    rect_color = (255, 255, 255)
+                    face_metrics: dict = {}
+
+                    name = (self.current_frame_face_name_list[k]
+                            if k < len(self.current_frame_face_name_list) else "unknown")
+
+                    if name != "unknown":
+                        face_id = name
+                        shape   = predictor(img_rd, d)
+                        blinked, ear, lEye, rEye = self.detect_blink(shape)
+                        is_live, spoof_msg = self.detect_liveness(face_id, img_rd, d, shape)
+                        rect_color = (0, 255, 0) if is_live else (0, 0, 255)
+
+                        if blinked:
+                            self.person_blink_status[face_id] = True
+                            self.blink_detected = False
+
+                        # Eye contours
+                        cv2.drawContours(img_rd, [np.array(lEye)], -1, (0, 255, 0), 1)
+                        cv2.drawContours(img_rd, [np.array(rEye)], -1, (0, 255, 0), 1)
+
+                        # Mouth aspect ratio
+                        mouth = [(shape.part(i).x, shape.part(i).y) for i in range(48, 60)]
+                        mar = 0.0
+                        if mouth:
+                            mw = dist.euclidean(mouth[0], mouth[6])
+                            mh = dist.euclidean(mouth[3], mouth[9])
+                            mar = mh / max(mw, 1e-6)
+
+                        nose_len = dist.euclidean(
+                            (shape.part(30).x, shape.part(30).y),
+                            (shape.part(27).x, shape.part(27).y),
+                        )
+                        motion_val = float(np.mean(self.face_motion_history[face_id])) \
+                            if face_id in self.face_motion_history \
+                               and self.face_motion_history[face_id] else 0.0
+                        liveness_val = self.liveness_scores.get(face_id, 0.0)
+                        challenge    = self.current_challenges.get(face_id, "NONE")
+                        progress     = self.challenge_progress.get(face_id, 0)
+
+                        # OSD annotations
+                        x0, y0, ls = d.right() + 10, d.top(), 22
+                        cv2.putText(img_rd, f"ID: {face_id}",           (x0, y0),        self.font, 0.65, rect_color, 1)
+                        cv2.putText(img_rd, f"Live: {liveness_val:.1f}",(x0, y0+ls),     self.font, 0.55, rect_color, 1)
+                        cv2.putText(img_rd, f"Blink: {self.person_blink_status.get(face_id,False)}", (x0, y0+ls*2), self.font, 0.55, (0,255,0) if self.person_blink_status.get(face_id) else (0,0,255), 1)
+                        cv2.putText(img_rd, f"EAR: {ear:.2f}",          (x0, y0+ls*3),   self.font, 0.55, (0,255,255), 1)
+                        cv2.putText(img_rd, f"MAR: {mar:.2f}",          (x0, y0+ls*4),   self.font, 0.55, (0,255,255), 1)
+                        cv2.putText(img_rd, f"Motion: {motion_val:.2f}",(x0, y0+ls*5),   self.font, 0.55, (0,255,255), 1)
+                        if CHALLENGE_ACTIVE:
+                            cc = (0,255,0) if self.challenge_complete.get(face_id) else (0,165,255)
+                            cv2.putText(img_rd, f"Challenge: {challenge} ({progress}/10)",
+                                        (x0, y0+ls*6), self.font, 0.55, cc, 1)
+                        if not is_live:
+                            cv2.putText(img_rd, f"SPOOF: {spoof_msg}",
+                                        (d.left(), d.bottom() + 25), self.font, 0.65, (0,0,255), 1)
+
+                        # Key landmark dots
+                        for i in [0, 8, 16, 27, 30, 36, 39, 42, 45, 48, 54]:
+                            cv2.circle(img_rd, (shape.part(i).x, shape.part(i).y), 2, (0,255,255), -1)
+
+                        face_metrics = {
+                            "face_id":     face_id,
+                            "liveness":    liveness_val,
+                            "blinked":     self.person_blink_status.get(face_id, False),
+                            "ear":         ear,
+                            "mar":         mar,
+                            "motion":      motion_val,
+                            "nose_length": nose_len,
+                            "challenge":   f"{challenge} ({progress}/10)",
+                            "spoof_message": spoof_msg if not is_live else "Live",
+                        }
+
+                    cv2.rectangle(img_rd, (d.left(), d.top()), (d.right(), d.bottom()), rect_color, 2)
+                    metrics_callback(face_metrics)
+
+                if self.current_frame_face_cnt > 1:
+                    self.centroid_tracker()
+                for i in range(self.current_frame_face_cnt):
+                    cv2.putText(img_rd,
+                                self.current_frame_face_name_list[i],
+                                self.current_frame_face_position_list[i],
+                                self.font, 0.8, (0, 255, 255), 1)
+
+            else:
+                # ── scene 2: face count changed ───────────────────────────────
+                self.current_frame_face_position_list     = []
+                self.current_frame_face_X_e_distance_list = []
+                self.current_frame_face_feature_list      = []
+                self.reclassify_interval_cnt = 0
+
+                if self.current_frame_face_cnt == 0:
+                    self.current_frame_face_name_list = []
+                    metrics_callback({})
                 else:
-                    logging.debug("scene 2: / Faces cnt changes in this frame")
-                    self.current_frame_face_position_list = []
-                    self.current_frame_face_X_e_distance_list = []
-                    self.current_frame_face_feature_list = []
-                    self.reclassify_interval_cnt = 0
-                    if self.current_frame_face_cnt == 0:
-                        logging.debug("  / No faces in this frame!!!")
-                        self.current_frame_face_name_list = []
-                        update_metrics_callback({})
-                    else:
-                        logging.debug("  scene 2.2  Get faces in this frame and do face recognition")
-                        self.current_frame_face_name_list = []
-                        for i in range(len(faces)):
-                            shape = predictor(img_rd, faces[i])
-                            self.current_frame_face_feature_list.append(
-                                face_reco_model.compute_face_descriptor(img_rd, shape))
-                            self.current_frame_face_name_list.append("unknown")
-                            blink_detected, ear, leftEye, rightEye = self.detect_blink(shape)
-                            leftEyeHull = np.array(leftEye)
-                            rightEyeHull = np.array(rightEye)
-                            cv2.drawContours(img_rd, [leftEyeHull], -1, (0, 255, 0), 1)
-                            cv2.drawContours(img_rd, [rightEyeHull], -1, (0, 255, 0), 1)
-                            cv2.putText(img_rd, f"EAR: {ear:.2f}",
-                                        (faces[i].right() + 10, faces[i].top()),
-                                        self.font, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
-                        for k in range(len(faces)):
-                            self.current_frame_face_centroid_list.append(
-                                [int(faces[k].left() + faces[k].right()) / 2,
-                                 int(faces[k].top() + faces[k].bottom()) / 2])
-                            self.current_frame_face_position_list.append(tuple(
-                                [faces[k].left(), int(faces[k].bottom() + (faces[k].bottom() - faces[k].top()) / 4)]))
-                            self.current_frame_face_X_e_distance_list = []
-                            for i in range(len(self.face_features_known_list)):
-                                if str(self.face_features_known_list[i][0]) != '0.0':
-                                    e_distance_tmp = self.return_euclidean_distance(
-                                        self.current_frame_face_feature_list[k],
-                                        self.face_features_known_list[i])
-                                    self.current_frame_face_X_e_distance_list.append(e_distance_tmp)
-                                else:
-                                    self.current_frame_face_X_e_distance_list.append(999999999)
-                            similar_person_num = self.current_frame_face_X_e_distance_list.index(
-                                min(self.current_frame_face_X_e_distance_list))
-                            if min(self.current_frame_face_X_e_distance_list) < 0.4:
-                                self.current_frame_face_name_list[k] = self.face_name_known_list[similar_person_num]
-                                face_id = self.face_name_known_list[similar_person_num]
-                                shape = predictor(img_rd, faces[k])
-                                is_live, spoof_message = self.detect_liveness(face_id, img_rd, faces[k], shape)
-                                rect_color = (0, 255, 0) if is_live else (0, 0, 255)
-                                img_rd = cv2.rectangle(img_rd,
-                                                       tuple([faces[k].left(), faces[k].top()]),
-                                                       tuple([faces[k].right(), faces[k].bottom()]),
-                                                       rect_color, 2)
-                                liveness_score = self.liveness_scores.get(face_id, 0)
-                                cv2.putText(img_rd, f"Liveness: {liveness_score:.1f}%",
-                                            (faces[k].right() + 10, faces[k].top() + 100),
-                                            self.font, 0.7, rect_color, 1, cv2.LINE_AA)
-                                if not is_live:
-                                    cv2.putText(img_rd, f"ALERT: {spoof_message}",
-                                                (faces[k].left(), faces[k].bottom() + 25),
-                                                self.font, 0.7, (0, 0, 255), 1, cv2.LINE_AA)
-                                self.attendance(face_id)
-                                metrics = {
-                                    'face_id': face_id,
-                                    'liveness': liveness_score,
-                                    'blinked': self.person_blink_status.get(face_id, False),
-                                    'ear': 0,
-                                    'mar': 0,
-                                    'motion': 0,
-                                    'nose_length': 0,
-                                    'challenge': f"{self.current_challenges.get(face_id, 'NONE')} ({self.challenge_progress.get(face_id, 0)}/10)",
-                                    'spoof_message': spoof_message if not is_live else "No spoof detected"
-                                }
-                                update_metrics_callback(metrics)
-                        self.draw_note(img_rd)
-                self.update_fps()
-                # Resize image for display
-                img_rd = cv2.resize(img_rd, (320, 240))
-                img_rgb = cv2.cvtColor(img_rd, cv2.COLOR_BGR2RGB)
-                img_pil = Image.fromarray(img_rgb)
-                img_tk = ImageTk.PhotoImage(img_pil)
-                video_label.img_tk = img_tk
-                video_label.configure(image=img_tk)
-                update_metrics_callback({
-                    'fps': self.fps,
-                    'frame_cnt': self.frame_cnt,
-                    'faces': self.current_frame_face_cnt,
-                    'blinks': self.total_blinks
-                }, is_system_metrics=True)
-                video_label.update()
+                    self.current_frame_face_name_list = []
+                    for i, face in enumerate(faces):
+                        shape = predictor(img_rd, face)
+                        self.current_frame_face_feature_list.append(
+                            face_reco_model.compute_face_descriptor(img_rd, shape)
+                        )
+                        self.current_frame_face_name_list.append("unknown")
+                        blinked, ear, lEye, rEye = self.detect_blink(shape)
+                        cv2.drawContours(img_rd, [np.array(lEye)], -1, (0,255,0), 1)
+                        cv2.drawContours(img_rd, [np.array(rEye)], -1, (0,255,0), 1)
+                        cv2.putText(img_rd, f"EAR:{ear:.2f}",
+                                    (face.right()+10, face.top()), self.font, 0.65, (0,255,255), 1)
 
-    def run(self, video_label, update_metrics_callback):
+                    for k, face in enumerate(faces):
+                        cx = int((face.left() + face.right()) / 2)
+                        cy = int((face.top()  + face.bottom()) / 2)
+                        self.current_frame_face_centroid_list.append([cx, cy])
+                        self.current_frame_face_position_list.append(
+                            (face.left(), int(face.bottom() + (face.bottom()-face.top())/4))
+                        )
+
+                        dists_list = []
+                        for feat in self.face_features_known_list:
+                            d_val = self.euclidean(self.current_frame_face_feature_list[k], feat) \
+                                if str(feat[0]) != "0.0" else 999999
+                            dists_list.append(d_val)
+
+                        best_idx  = dists_list.index(min(dists_list))
+                        best_dist = min(dists_list)
+                        rect_color = (255, 255, 255)
+
+                        if best_dist < 0.4:
+                            face_id = self.face_name_known_list[best_idx]
+                            self.current_frame_face_name_list[k] = face_id
+                            shape = predictor(img_rd, face)
+                            is_live, spoof_msg = self.detect_liveness(face_id, img_rd, face, shape)
+                            rect_color = (0, 255, 0) if is_live else (0, 0, 255)
+                            liveness_val = self.liveness_scores.get(face_id, 0.0)
+                            cv2.putText(img_rd, f"Live:{liveness_val:.1f}",
+                                        (face.right()+10, face.top()+25), self.font, 0.65, rect_color, 1)
+                            if not is_live:
+                                cv2.putText(img_rd, f"SPOOF:{spoof_msg}",
+                                            (face.left(), face.bottom()+25), self.font, 0.65, (0,0,255), 1)
+                            self.attendance(face_id)
+                            metrics_callback({
+                                "face_id":     face_id,
+                                "liveness":    liveness_val,
+                                "blinked":     self.person_blink_status.get(face_id, False),
+                                "ear": 0.0, "mar": 0.0, "motion": 0.0, "nose_length": 0.0,
+                                "challenge":   f"{self.current_challenges.get(face_id,'NONE')} ({self.challenge_progress.get(face_id,0)}/10)",
+                                "spoof_message": spoof_msg if not is_live else "Live",
+                            })
+
+                        cv2.rectangle(img_rd, (face.left(), face.top()),
+                                      (face.right(), face.bottom()), rect_color, 2)
+
+            self.draw_note(img_rd)
+            self.update_fps()
+
+            # ── convert BGR→RGB and emit to UI ────────────────────────────
+            img_rgb = cv2.cvtColor(img_rd, cv2.COLOR_BGR2RGB)
+            frame_callback(img_rgb)
+            metrics_callback(
+                {
+                    "fps":       self.fps,
+                    "frame_cnt": self.frame_cnt,
+                    "faces":     self.current_frame_face_cnt,
+                    "blinks":    self.total_blinks,
+                },
+                is_system_metrics=True,
+            )
+
+    def run(self, cap: cv2.VideoCapture, frame_callback, metrics_callback) -> None:
+        """Process frames from an already-opened VideoCapture (opened on main thread)."""
+        for _ in range(5):
+            cap.read()   # flush initial frames
+        self.process(cap, frame_callback, metrics_callback)
+
+
+# ===========================================================================
+# Background QThread for video processing
+# ===========================================================================
+
+class VideoThread(QThread):
+    frame_signal   = pyqtSignal(np.ndarray)   # RGB frame
+    metrics_signal = pyqtSignal(dict, bool)   # (metrics, is_system)
+
+    def __init__(self, face_recognizer: Face_Recognizer, cap: cv2.VideoCapture) -> None:
+        super().__init__()
+        self.fr  = face_recognizer
+        self.cap = cap  # camera opened on main thread (macOS AVFoundation requirement)
+
+    def run(self) -> None:
+        self.fr.run(self.cap, self._on_frame, self._on_metrics)
+
+    def _on_frame(self, rgb: np.ndarray) -> None:
+        self.frame_signal.emit(rgb)
+
+    def _on_metrics(self, metrics: dict, is_system_metrics: bool = False) -> None:
+        self.metrics_signal.emit(metrics, is_system_metrics)
+
+    def stop(self) -> None:
+        self.fr.stop_thread = True
+        self.wait(3000)
+
+
+# ===========================================================================
+# PyQt6 main application window
+# ===========================================================================
+
+class FaceRecognitionApp(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Face Recognition  |  Anti-Spoofing Attendance System")
+        self.setMinimumSize(1100, 660)
+
+        self.face_recognizer = Face_Recognizer()
+        self.cap = self._open_camera()   # MUST open on main thread (macOS AVFoundation)
+        self._build_ui()
+        self._start_video_thread()
+
+    # =========================================================================
+    # Camera init (must run on main thread on macOS)
+    # =========================================================================
+
+    def _open_camera(self) -> cv2.VideoCapture | None:
+        """Open the camera on the main thread so macOS AVFoundation can request permission."""
         cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
         if not cap.isOpened():
-            logging.error("Error: Could not open camera")
-            return
-        for _ in range(10):
-            cap.read()
-        self.process(cap, video_label, update_metrics_callback)
-        cap.release()
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                None, "Camera Error",
+                "Could not open camera.\n"
+                "• Check macOS Privacy → Camera permissions for Terminal / Python.\n"
+                "• No other app should be using the camera.",
+            )
+            logger.error("Could not open camera — check macOS camera permissions")
+            return None
+        logger.info("Camera opened on main thread ✓")
+        return cap
 
+    # =========================================================================
+    # UI
+    # =========================================================================
 
-class FaceRecognitionApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Face Recognition System")
-        self.root.configure(bg="#F0F0F0")
-        self.face_recognizer = Face_Recognizer()
-        self.running = True
-        self.setup_ui()
-        self.start_processing()
-
-    def setup_ui(self):
-        # Main container
-        self.main_frame = tk.Frame(self.root, bg="#FFFFFF", padx=300, pady=150)
-        self.main_frame.pack(expand=True, fill="both")
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
 
         # Title
-        tk.Label(self.main_frame, text="Face Recognition with Anti-Spoofing", font=("Helvetica", 18, "bold"),
-                 bg="#FFFFFF", fg="#000000").pack(pady=10)
-        # Video and metrics container
-        self.content_frame = tk.Frame(self.main_frame, bg="#FFFFFF")
-        self.content_frame.pack(fill="both", expand=True)
+        title = QLabel("Face Recognition  ·  Anti-Spoofing Attendance")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setFont(QFont("Helvetica", 16, QFont.Weight.Bold))
+        root.addWidget(title)
 
-        # Video frame
-        self.video_frame = tk.Frame(self.content_frame, bg="#FFFFFF", bd=2, relief="solid", width=626, height=417)
-        self.video_frame.pack(side="left", padx=10, pady=10)
-        self.video_frame.pack_propagate(False)
+        # Content row
+        content = QHBoxLayout()
+        content.setSpacing(10)
 
-        self.video_label = tk.Label(self.video_frame, bg="#FFFFFF")
-        self.video_label.pack()
+        # ── video display ─────────────────────────────────────────────────
+        vid_group = QGroupBox("Live Camera")
+        vid_layout = QVBoxLayout(vid_group)
+        self.video_label = QLabel()
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setMinimumSize(640, 480)
+        self.video_label.setStyleSheet("background:#111;")
+        vid_layout.addWidget(self.video_label)
+        content.addWidget(vid_group, stretch=3)
 
-        # Metrics frame
-        self.metrics_frame = tk.Frame(self.content_frame, bg="#FFFFFF")
-        self.metrics_frame.pack(side="left", padx=10, pady=10, fill="both")
+        # ── metrics panel ────────────────────────────────────────────────
+        metrics_widget = QWidget()
+        metrics_widget.setMaximumWidth(330)
+        metrics_layout = QVBoxLayout(metrics_widget)
+        metrics_layout.setSpacing(6)
+        metrics_layout.setContentsMargins(0, 0, 0, 0)
 
-        # System Info
-        self.system_frame = tk.LabelFrame(self.metrics_frame, text="System Info", font=("Helvetica", 12, "bold"),
-                                          bg="#F0F0F0", fg="#333333", padx=10, pady=5)
-        self.system_frame.pack(fill="x", pady=5)
-        self.fps_label = tk.Label(self.system_frame, text="FPS: 0.0", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.fps_label.pack(anchor="w")
-        self.frame_label = tk.Label(self.system_frame, text="Frame: 0", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.frame_label.pack(anchor="w")
-        self.faces_label = tk.Label(self.system_frame, text="Faces: 0", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.faces_label.pack(anchor="w")
-        self.blinks_label = tk.Label(self.system_frame, text="Blinks: 0", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.blinks_label.pack(anchor="w")
+        metrics_layout.addWidget(self._build_system_info_panel())
+        metrics_layout.addWidget(self._build_face_metrics_panel())
+        metrics_layout.addWidget(self._build_antispoofing_panel())
+        metrics_layout.addStretch()
 
-        # Face Metrics
-        self.face_frame = tk.LabelFrame(self.metrics_frame, text="Face Metrics", font=("Helvetica", 12, "bold"),
-                                        bg="#F0F0F0", fg="#333333", padx=10, pady=5)
-        self.face_frame.pack(fill="x", pady=5)
-        self.face_id_label = tk.Label(self.face_frame, text="Face ID: None", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.face_id_label.pack(anchor="w")
-        self.liveness_label = tk.Label(self.face_frame, text="Liveness: 0.0%", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.liveness_label.pack(anchor="w")
-        self.blinked_label = tk.Label(self.face_frame, text="Blinked: False", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.blinked_label.pack(anchor="w")
-        self.ear_label = tk.Label(self.face_frame, text="EAR: 0.00", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.ear_label.pack(anchor="w")
-        self.mar_label = tk.Label(self.face_frame, text="MAR: 0.00", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.mar_label.pack(anchor="w")
-        self.motion_label = tk.Label(self.face_frame, text="Motion: 0.00", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.motion_label.pack(anchor="w")
-        self.nose_label = tk.Label(self.face_frame, text="Nose Length: 0.00", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.nose_label.pack(anchor="w")
-        self.challenge_label = tk.Label(self.face_frame, text="Challenge: NONE", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.challenge_label.pack(anchor="w")
-        self.spoof_label = tk.Label(self.face_frame, text="Spoof: None", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333")
-        self.spoof_label.pack(anchor="w")
+        content.addWidget(metrics_widget, stretch=1)
+        root.addLayout(content, stretch=1)
 
-        # Anti-Spoofing Methods
-        self.spoof_frame = tk.LabelFrame(self.metrics_frame, text="Anti-Spoofing Methods", font=("Helvetica", 12, "bold"),
-                                         bg="#F0F0F0", fg="#333333", padx=10, pady=5)
-        self.spoof_frame.pack(fill="x", pady=5)
-        tk.Label(self.spoof_frame, text="- Texture Analysis", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333").pack(anchor="w")
-        tk.Label(self.spoof_frame, text="- Motion Analysis", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333").pack(anchor="w")
-        tk.Label(self.spoof_frame, text="- Challenge-Response", font=("Helvetica", 10), bg="#F0F0F0", fg="#333333").pack(anchor="w")
+        # Quit
+        quit_btn = QPushButton("✖  Quit")
+        quit_btn.setStyleSheet(
+            "background:#e53935; color:white; padding:10px; font-size:13px;"
+            "font-weight:bold; border-radius:4px;"
+        )
+        quit_btn.clicked.connect(self._quit)
+        root.addWidget(quit_btn)
 
-        # Quit Button
-        self.quit_button = tk.Button(self.main_frame, text="Quit", font=("Helvetica", 12, "bold"), bg="#FF4C4C", fg="#FFFFFF",command=self.quit, width=10)
-        self.quit_button.pack(pady=10)      
+    def _build_system_info_panel(self) -> QGroupBox:
+        group = QGroupBox("System Info")
+        grid  = QGridLayout(group)
+        grid.setColumnStretch(1, 1)
 
-    def update_metrics(self, metrics, is_system_metrics=False):
-        if is_system_metrics:
-            self.fps_label.configure(text=f"FPS: {metrics.get('fps', 0.0):.2f}")
-            self.frame_label.configure(text=f"Frame: {metrics.get('frame_cnt', 0)}")
-            self.faces_label.configure(text=f"Faces: {metrics.get('faces', 0)}")
-            self.blinks_label.configure(text=f"Blinks: {metrics.get('blinks', 0)}")
-        else:
-            if not metrics:
-                self.face_id_label.configure(text="Face ID: None")
-                self.liveness_label.configure(text="Liveness: 0.0%")
-                self.blinked_label.configure(text="Blinked: False")
-                self.ear_label.configure(text="EAR: 0.00")
-                self.mar_label.configure(text="MAR: 0.00")
-                self.motion_label.configure(text="Motion: 0.00")
-                self.nose_label.configure(text="Nose Length: 0.00")
-                self.challenge_label.configure(text="Challenge: NONE")
-                self.spoof_label.configure(text="Spoof: None")
-            else:
-                self.face_id_label.configure(text=f"Face ID: {metrics.get('face_id', 'None')}")
-                self.liveness_label.configure(text=f"Liveness: {metrics.get('liveness', 0.0):.1f}%")
-                self.blinked_label.configure(text=f"Blinked: {metrics.get('blinked', False)}")
-                self.ear_label.configure(text=f"EAR: {metrics.get('ear', 0.0):.2f}")
-                self.mar_label.configure(text=f"MAR: {metrics.get('mar', 0.0):.2f}")
-                self.motion_label.configure(text=f"Motion: {metrics.get('motion', 0.0):.2f}")
-                self.nose_label.configure(text=f"Nose Length: {metrics.get('nose_length', 0.0):.2f}")
-                self.challenge_label.configure(text=f"Challenge: {metrics.get('challenge', 'NONE')}")
-                self.spoof_label.configure(text=f"Spoof: {metrics.get('spoof_message', 'None')}")
+        def row(label, row_idx):
+            grid.addWidget(QLabel(label), row_idx, 0)
+            lbl = QLabel("—")
+            grid.addWidget(lbl, row_idx, 1)
+            return lbl
 
-    def start_processing(self):
-        self.processing_thread = threading.Thread(target=self.face_recognizer.run,
-                                                 args=(self.video_label, self.update_metrics))
-        self.processing_thread.daemon = True
-        self.processing_thread.start()
+        self.lbl_fps    = row("FPS:",    0)
+        self.lbl_frame  = row("Frame:",  1)
+        self.lbl_faces  = row("Faces:",  2)
+        self.lbl_blinks = row("Blinks:", 3)
+        return group
 
-    def quit(self):
-        self.running = False
-        self.face_recognizer.stop_thread = True
-        self.root.quit()
-        self.root.destroy()
+    def _build_face_metrics_panel(self) -> QGroupBox:
+        group = QGroupBox("Face Metrics")
+        grid  = QGridLayout(group)
+        grid.setColumnStretch(1, 1)
+
+        def row(label, row_idx):
+            grid.addWidget(QLabel(label), row_idx, 0)
+            lbl = QLabel("—")
+            grid.addWidget(lbl, row_idx, 1)
+            return lbl
+
+        self.lbl_face_id    = row("Face ID:",     0)
+        self.lbl_liveness   = row("Liveness:",    1)
+        self.lbl_blinked    = row("Blinked:",     2)
+        self.lbl_ear        = row("EAR:",         3)
+        self.lbl_mar        = row("MAR:",         4)
+        self.lbl_motion     = row("Motion:",      5)
+        self.lbl_nose       = row("Nose Length:", 6)
+        self.lbl_challenge  = row("Challenge:",   7)
+        self.lbl_spoof      = row("Spoof Status:",8)
+        return group
+
+    def _build_antispoofing_panel(self) -> QGroupBox:
+        group  = QGroupBox("Anti-Spoofing Methods Active")
+        layout = QVBoxLayout(group)
+        for method in [
+            "✅  Eye Blink Detection (EAR)",
+            "✅  Motion Analysis (landmark variance)",
+            "✅  Texture Analysis (HOG descriptor)",
+            "✅  Challenge-Response (Blink / Nod)",
+            "✅  Composite Liveness Score (≥50 = VALID)",
+        ]:
+            lbl = QLabel(method)
+            lbl.setFont(QFont("", 9))
+            layout.addWidget(lbl)
+        return group
+
+    # =========================================================================
+    # Video thread
+    # =========================================================================
+
+    def _start_video_thread(self) -> None:
+        if not self.cap:
+            return  # camera failed to open
+        self.video_thread = VideoThread(self.face_recognizer, self.cap)
+        self.video_thread.frame_signal.connect(self._update_frame)
+        self.video_thread.metrics_signal.connect(self._update_metrics)
+        self.video_thread.start()
+
+    # =========================================================================
+    # Slots
+    # =========================================================================
+
+    def _update_frame(self, rgb: np.ndarray) -> None:
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pix  = QPixmap.fromImage(qimg)
+        self.video_label.setPixmap(
+            pix.scaled(
+                self.video_label.width(),
+                self.video_label.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _update_metrics(self, metrics: dict, is_system: bool) -> None:
+        if is_system:
+            self.lbl_fps.setText(f"{metrics.get('fps', 0):.2f}")
+            self.lbl_frame.setText(str(metrics.get("frame_cnt", 0)))
+            self.lbl_faces.setText(str(metrics.get("faces", 0)))
+            self.lbl_blinks.setText(str(metrics.get("blinks", 0)))
+            return
+
+        if not metrics:
+            for lbl in [self.lbl_face_id, self.lbl_liveness, self.lbl_blinked,
+                        self.lbl_ear, self.lbl_mar, self.lbl_motion,
+                        self.lbl_nose, self.lbl_challenge, self.lbl_spoof]:
+                lbl.setText("—")
+            return
+
+        liveness = metrics.get("liveness", 0.0)
+        self.lbl_face_id.setText(str(metrics.get("face_id", "—")))
+        self.lbl_liveness.setText(f"{liveness:.1f}")
+        self.lbl_liveness.setStyleSheet(
+            "color:green; font-weight:bold;" if liveness >= 50 else "color:red;"
+        )
+        blinked = metrics.get("blinked", False)
+        self.lbl_blinked.setText(str(blinked))
+        self.lbl_blinked.setStyleSheet(
+            "color:green;" if blinked else "color:orange;"
+        )
+        self.lbl_ear.setText(f"{metrics.get('ear', 0):.3f}")
+        self.lbl_mar.setText(f"{metrics.get('mar', 0):.3f}")
+        self.lbl_motion.setText(f"{metrics.get('motion', 0):.3f}")
+        self.lbl_nose.setText(f"{metrics.get('nose_length', 0):.1f}")
+        self.lbl_challenge.setText(str(metrics.get("challenge", "NONE")))
+        spoof_msg = str(metrics.get("spoof_message", "—"))
+        self.lbl_spoof.setText(spoof_msg)
+        self.lbl_spoof.setStyleSheet(
+            "color:green;" if spoof_msg in ("Live", "No spoof detected") else "color:red;"
+        )
+
+    def _quit(self) -> None:
+        self.video_thread.stop()
+        self.close()
+
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "video_thread"):
+            self.video_thread.stop()
+        if self.cap:
+            self.cap.release()
+        event.accept()
 
 
-def main():
-    logging.basicConfig(level=logging.INFO)
-    root = tk.Tk()
-    app = FaceRecognitionApp(root)
-    root.mainloop()
+# ===========================================================================
+# Entry point
+# ===========================================================================
+
+def main() -> None:
+    # Initialise PostgreSQL schema before starting the GUI
+    try:
+        init_db()
+    except Exception as e:
+        logger.error("Cannot connect to database: %s", e)
+        print(f"\n❌  Database connection failed: {e}")
+        print("    Make sure PostgreSQL is running:  docker compose up -d\n")
+        sys.exit(1)
+
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = FaceRecognitionApp()
+    win.show()
+    sys.exit(app.exec())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
