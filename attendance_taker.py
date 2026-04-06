@@ -64,15 +64,15 @@ RIGHT_EYE_START, RIGHT_EYE_END = 36, 42
 # ---------------------------------------------------------------------------
 # Anti-spoofing / liveness constants
 # ---------------------------------------------------------------------------
-EYE_AR_THRESH        = 0.30   # EAR below this → blink
-EYE_AR_CONSEC_FRAMES = 1      # consecutive frames required
-BLINK_REQUIRED       = False  # set True to enforce blink before VALID
+EYE_AR_THRESH        = 0.28   # EAR below this → blink (slightly relaxed)
+EYE_AR_CONSEC_FRAMES = 2      # consecutive frames below threshold to confirm blink
+BLINK_REQUIRED       = False  # set True to require blink before VALID
 
 MOTION_FRAMES     = 10
-MOTION_THRESHOLD  = 0.05
+MOTION_THRESHOLD  = 0.008    # ← was 0.05; a real person sitting still passes this
 CHALLENGE_ACTIVE  = True
 CHALLENGE_TYPES   = ["BLINK", "NOD"]
-CHALLENGE_DURATION = 50
+CHALLENGE_DURATION = 100     # ← was 50; gives ~3 seconds at 30 fps to complete
 
 logging.basicConfig(
     level=logging.INFO,
@@ -232,8 +232,12 @@ class Face_Recognizer:
             history   = list(self.face_motion_history[face_id])
             avg       = float(np.mean(history))
             variance  = float(np.var(history))
-            is_loop   = variance < 0.001 and len(history) == MOTION_FRAMES
-            is_real   = avg > MOTION_THRESHOLD and variance > 0.01 and not is_loop
+            # A looping video has near-zero variance AND exactly MOTION_FRAMES history
+            is_loop   = variance < 0.0005 and len(history) == MOTION_FRAMES
+            # Real person sitting still: avg > very-low threshold, not a loop
+            # Removed harsh variance>0.01 requirement — that incorrectly penalised
+            # people sitting calmly in front of the camera.
+            is_real   = avg > MOTION_THRESHOLD and not is_loop
             return avg, is_real
         return 0.0, False
 
@@ -311,37 +315,58 @@ class Face_Recognizer:
         score         = 0.0
         spoof_reasons = []
 
-        # 1. Challenge (20 pts)
+        # ── 1. Challenge (0-25 pts, proportional to progress) ────────────────
+        #    Give partial credit so early frames don't immediately fail.
+        #    Full 25 pts when complete, prorated before that.
+        challenge = self.generate_challenge(face_id)
         challenge_ok = self.check_challenge_response(face_id, shape)
+        progress  = self.challenge_progress.get(face_id, 0)
         if challenge_ok:
-            score += 20
+            score += 25
+        elif challenge == "NONE":
+            score += 25   # challenges disabled — full points
         else:
-            spoof_reasons.append("Challenge incomplete")
+            # Partial credit: 0-15 pts proportional to progress (0-10)
+            score += min(15.0, progress * 1.5)
+            spoof_reasons.append(f"Challenge in-progress ({progress}/10)")
 
-        # 2. Motion (max 40 pts)
+        # ── 2. Motion (0-40 pts) ─────────────────────────────────────────────
         motion_val, is_real_motion = self.analyze_face_motion(face_id, shape)
         if is_real_motion:
-            score += min(40.0, motion_val * 200)
+            score += min(40.0, motion_val * 2000)
+        elif motion_val > 0:
+            # Partial credit for low-but-nonzero motion (person sitting still)
+            score += min(20.0, motion_val * 1000)
         else:
-            spoof_reasons.append("Unnatural motion")
+            spoof_reasons.append("No motion yet")
 
-        # 3. Texture (max 40 pts, checked every 5 frames to save CPU)
+        # ── 3. Texture (0-35 pts, checked every 5 frames to save CPU) ────────
         if self.frame_cnt % 5 == 0:
             tex_score, is_real_tex = self.analyze_face_texture(roi)
             if is_real_tex:
-                score += min(40.0, tex_score)
+                score += min(35.0, tex_score)
+            elif tex_score > 0:
+                # Partial credit — real faces in poor lighting still have some texture
+                score += min(15.0, tex_score * 20)
             else:
-                spoof_reasons.append("Fake texture")
+                spoof_reasons.append("Low texture")
 
-        # Exponential smoothing
-        alpha = 0.30
+        # ── Exponential smoothing (α=0.35 — slightly faster to respond) ──────
+        alpha = 0.35
         self.liveness_scores[face_id] = (
             alpha * score + (1 - alpha) * self.liveness_scores[face_id]
         )
 
-        is_live = self.liveness_scores[face_id] >= 50
-        if not is_live and self.frame_cnt > 30:
+        # ── Threshold: 35 (was 50) — more forgiving for real people ──────────
+        is_live = self.liveness_scores[face_id] >= 35
+
+        # Mark spoof only after 60 frames (~2 sec) to allow warmup.
+        # Critically: RESET spoof flag if score recovers — don't permanently lock.
+        if not is_live and self.frame_cnt > 60:
             self.spoof_detected[face_id] = True
+        elif is_live:
+            # Score recovered — person is genuinely live, clear the spoof flag
+            self.spoof_detected[face_id] = False
 
         msg = ", ".join(spoof_reasons) if spoof_reasons else "Live"
         return is_live, msg

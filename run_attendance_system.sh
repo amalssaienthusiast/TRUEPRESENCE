@@ -55,7 +55,7 @@ if [ ! -f "$LANDMARKS" ] || [ ! -f "$FACE_REC" ]; then
     read -rp "Press Enter to continue anyway, or Ctrl-C to abort..."
 fi
 
-# --- Launch Flask dashboard --------------------------------------------------
-info "Launching Flask dashboard → http://localhost:5000"
-cd flask_app
-exec $PYTHON app.py
+# --- Launch FastAPI dashboard ------------------------------------------------
+info "Launching FastAPI dashboard → http://localhost:8000"
+info "API docs available at  → http://localhost:8000/docs"
+exec $PYTHON -m uvicorn app.main:app --host 0.0.0.0 --port 8000

@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="TruePresence — Attendance records viewer with search, filter, and CSV export.">
+  <meta name="theme-color" content="#0d1117">
+  <title>Attendance Records — TruePresence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+
+<div id="toast-container" role="status" aria-live="polite"></div>
+
+<div class="container">
+
+  <!-- ── Header ─────────────────────────────────────────────────────── -->
+  <header>
+    <a href="/" class="back-btn" aria-label="Back to dashboard">
+      <i class="fas fa-arrow-left" aria-hidden="true"></i> Dashboard
+    </a>
+    <div class="header-logo">
+      <i class="fas fa-table logo-icon" aria-hidden="true"></i>
+      <h1>Attendance Records</h1>
+    </div>
+  </header>
+
+  <!-- ── Main ───────────────────────────────────────────────────────── -->
+  <div class="attendance-container">
+
+    {% if error %}
+    <!-- DB error banner -->
+    <div class="page-error" role="alert">
+      <i class="fas fa-database" aria-hidden="true"></i>
+      <div>
+        <strong>Database Unavailable</strong><br>
+        <span style="font-size:0.85rem;opacity:0.8;">{{ error }}</span>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if records %}
+    <!-- Filters -->
+    <div class="filters">
+      <div class="search-box">
+        <i class="fas fa-search" aria-hidden="true"></i>
+        <input
+          type="text"
+          id="search-input"
+          placeholder="Search by name…"
+          aria-label="Search attendance records by name"
+          autocomplete="off"
+        >
+      </div>
+      <div class="filter-options">
+        <select id="status-filter" aria-label="Filter by status">
+          <option value="all">All Status</option>
+          <option value="VALID">Valid</option>
+          <option value="INVALID">Invalid</option>
+          <option value="UNKNOWN">Unknown</option>
+        </select>
+        <select id="date-filter" aria-label="Filter by date">
+          <option value="all">All Dates</option>
+          {% for date in records.keys() %}
+          <option value="{{ date }}">{{ date }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <!-- Export button -->
+    <div class="records-header">
+      <a
+        href="/api/attendance/export"
+        class="btn info small"
+        download
+        aria-label="Download attendance records as CSV"
+      ><i class="fas fa-file-csv" aria-hidden="true"></i> Export CSV</a>
+    </div>
+
+    <!-- Records by date -->
+    {% for date, date_records in records.items() %}
+    <div class="date-group" data-date="{{ date }}">
+      <div class="date-header">
+        <h2><i class="fas fa-calendar-alt" aria-hidden="true"></i> {{ date }}</h2>
+        <span class="record-count" id="count-{{ loop.index }}">{{ date_records|length }} records</span>
+      </div>
+      <table class="records-table" role="table" aria-label="Attendance for {{ date }}">
+        <thead>
+          <tr>
+            <th scope="col">Name</th>
+            <th scope="col">Time</th>
+            <th scope="col">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for record in date_records %}
+          <tr
+            class="record-row"
+            data-name="{{ record.name }}"
+            data-status="{{ record.status }}"
+          >
+            <td>{{ record.name }}</td>
+            <td>{{ record.time }}</td>
+            <td>
+              <span class="status-cell {% if 'INVALID' in record.status %}invalid{% else %}valid{% endif %}">
+                {% if 'INVALID' in record.status %}
+                  <i class="fas fa-times-circle" aria-hidden="true"></i>
+                {% else %}
+                  <i class="fas fa-check-circle" aria-hidden="true"></i>
+                {% endif %}
+                {{ record.status }}
+              </span>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+
+    {% elif not error %}
+    <!-- Empty state -->
+    <div class="empty-state" role="region" aria-label="No records found">
+      <i class="fas fa-clipboard-list" aria-hidden="true"></i>
+      <p>No attendance records yet.</p>
+      <p style="margin-top:8px;font-size:0.82rem;">Run <strong>Take Attendance</strong> from the dashboard to start recording.</p>
+    </div>
+    {% endif %}
+
+  </div><!-- /.attendance-container -->
+
+  <footer>
+    <p>&copy; 2025 TruePresence &mdash; Face Recognition Attendance System</p>
+  </footer>
+
+</div><!-- /.container -->
+
+<script>
+'use strict';
+document.addEventListener('DOMContentLoaded', () => {
+  const searchInput  = document.getElementById('search-input');
+  const statusFilter = document.getElementById('status-filter');
+  const dateFilter   = document.getElementById('date-filter');
+
+  // Guard: elements only exist when records are present
+  if (!searchInput) return;
+
+  function applyFilters() {
+    const term   = searchInput.value.toLowerCase().trim();
+    const status = statusFilter.value;
+    const date   = dateFilter.value;
+
+    document.querySelectorAll('.date-group').forEach(group => {
+      const groupDate = group.dataset.date;
+      const dateMatch = date === 'all' || groupDate === date;
+      group.style.display = dateMatch ? '' : 'none';
+      if (!dateMatch) return;
+
+      let visible = 0;
+      group.querySelectorAll('.record-row').forEach(row => {
+        const nameMatch   = !term   || row.dataset.name.toLowerCase().includes(term);
+        const statusMatch = status === 'all' || row.dataset.status.includes(status);
+        const show        = nameMatch && statusMatch;
+        row.style.display = show ? '' : 'none';
+        if (show) visible++;
+      });
+
+      // Update visible count badge
+      const countEl = group.querySelector('.record-count');
+      if (countEl) countEl.textContent = `${visible} record${visible !== 1 ? 's' : ''}`;
+
+      // Hide the whole group if nothing visible
+      if (visible === 0) group.style.display = 'none';
+    });
+  }
+
+  searchInput.addEventListener('input',  applyFilters);
+  statusFilter.addEventListener('change', applyFilters);
+  dateFilter.addEventListener('change',   applyFilters);
+});
+</script>
+
+</body>
+</html>
